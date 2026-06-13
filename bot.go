@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"regexp"
 	"strings"
+	"time"
 )
 
 import (
@@ -15,15 +16,25 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
+const WaitTime = 2 * time.Second
+
+func sendMessage(ctx context.Context, b *bot.Bot, log *slog.Logger, chatID int64, text string) bool {
+	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: chatID,
+		Text:   text,
+	})
+	if err != nil {
+		log.Error("Failed to send message to chat", "chat_id", chatID, "err", err.Error())
+		return false
+	}
+
+	return true
+}
+
 func handlerStart(log *slog.Logger) func(ctx context.Context, b *bot.Bot, update *models.Update) {
 	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
-		_, err := b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: update.Message.Chat.ID,
-			Text:   "Привет! Это бот сделан, чтобы добавлять его в чат и определять, кто есть \"Лох дня!\"",
-		})
-		if err != nil {
-			log.Error("Failed to send message", "err", err.Error())
-		}
+		text := "Привет! Это бот сделан, чтобы добавлять его в чат и определять, кто есть \"Лох дня!\""
+		sendMessage(ctx, b, log, update.Message.Chat.ID, text)
 	}
 }
 
@@ -173,13 +184,8 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 			return
 		}
 		if len(players) == 0 {
-			_, err = b.SendMessage(ctx, &bot.SendMessageParams{
-				ChatID: chatId,
-				Text:   "Нет активных игроков(",
-			})
-			if err != nil {
-				log.Error("Failed to send message to chat", "chat_id", chatId, "err", err.Error())
-			}
+			text := "Нет активных игроков("
+			sendMessage(ctx, b, log, chatId, text)
 			return
 		}
 
@@ -203,13 +209,7 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 				message = fmt.Sprintf("Сегодня Красавчик Дня %s %s!", firstName, lastName)
 			}
 
-			_, err = b.SendMessage(ctx, &bot.SendMessageParams{
-				ChatID: chatId,
-				Text:   message,
-			})
-			if err != nil {
-				log.Error("Failed to send message to chat", "chat_id", chatId, "err", err.Error())
-			}
+			sendMessage(ctx, b, log, chatId, message)
 			return
 		}
 
@@ -238,13 +238,14 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 		} else {
 			message = fmt.Sprintf("Сегодня Красавчик дня...\n\n%s %s!!!", firstName, lastName)
 		}
-		_, err = b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatId,
-			Text:   message,
-		})
-		if err != nil {
-			log.Error("Failed to send message to chat", "chat_id", chatId, "err", err.Error())
-		}
+
+		sendMessage(ctx, b, log, chatId, "Смотрю на ваши лица...")
+		time.Sleep(WaitTime)
+		sendMessage(ctx, b, log, chatId, "Чекаю сообщения...")
+		time.Sleep(WaitTime)
+		sendMessage(ctx, b, log, chatId, "Готовлю губы для поцелуя...")
+		time.Sleep(WaitTime)
+		sendMessage(ctx, b, log, chatId, message)
 		return
 	}
 }
@@ -289,13 +290,7 @@ func handleLoxRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, 
 				message = fmt.Sprintf("Сегодня Лох Дня %s %s!", firstName, lastName)
 			}
 
-			_, err = b.SendMessage(ctx, &bot.SendMessageParams{
-				ChatID: chatId,
-				Text:   message,
-			})
-			if err != nil {
-				log.Error("Failed to send message to chat", "chat_id", chatId, "err", err.Error())
-			}
+			sendMessage(ctx, b, log, chatId, message)
 			return
 		}
 
@@ -323,13 +318,14 @@ func handleLoxRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, 
 		} else {
 			message = fmt.Sprintf("Сегодня Лох дня...\n\n%s %s!!!", firstName, lastName)
 		}
-		_, err = b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatId,
-			Text:   message,
-		})
-		if err != nil {
-			log.Error("Failed to send message to chat", "chat_id", chatId, "err", err.Error())
-		}
+
+		sendMessage(ctx, b, log, chatId, "Сру в штаны...")
+		time.Sleep(WaitTime)
+		sendMessage(ctx, b, log, chatId, "Надеваю ведро на голову...")
+		time.Sleep(WaitTime)
+		sendMessage(ctx, b, log, chatId, "Готовлюсь харкаться...")
+		time.Sleep(WaitTime)
+		sendMessage(ctx, b, log, chatId, message)
 		return
 	}
 }
@@ -389,13 +385,7 @@ func handleStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *
 			message.WriteString(line)
 		}
 
-		_, err = b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatId,
-			Text:   message.String(),
-		})
-		if err != nil {
-			log.Error("Failed to send message to chat", "chat_id", chatId, "err", err.Error())
-		}
+		sendMessage(ctx, b, log, chatId, message.String())
 	}
 }
 
@@ -427,13 +417,7 @@ func handleLoxStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot
 			message.WriteString(line)
 		}
 
-		_, err = b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatId,
-			Text:   message.String(),
-		})
-		if err != nil {
-			log.Error("Failed to send message to chat", "chat_id", chatId, "err", err.Error())
-		}
+		sendMessage(ctx, b, log, chatId, message.String())
 	}
 }
 

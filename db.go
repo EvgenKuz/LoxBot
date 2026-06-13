@@ -29,7 +29,6 @@ func CreateConnection() (*sql.DB, error) {
 	}
 	dir := filepath.Dir(exec)
 
-	println(filepath.Join(dir, "database", "database.sqlite"))
 	db, err := sql.Open("sqlite", filepath.Join(dir, "database", "database.sqlite"))
 	if err != nil {
 		return nil, err
@@ -157,7 +156,7 @@ UPDATE games SET lox_id = $1 WHERE chat_id = $2 and date = $3;
 
 func GetWinners(db *sql.DB, chatId int64) ([]GotLucky, error) {
 	statement := `
-SELECT users.user_id, COUNT(users.user_id) FROM games INNER JOIN users ON games.winner_id = users.id WHERE games.chat_id = $1 GROUP BY games.winner_id;
+SELECT users.user_id, COUNT(users.user_id) as got_lucky FROM games INNER JOIN users ON games.winner_id = users.id WHERE games.chat_id = $1 GROUP BY games.winner_id ORDER BY got_lucky;
 `
 	rows, err := db.Query(statement, chatId)
 	defer func(rows *sql.Rows) {
@@ -179,7 +178,7 @@ SELECT users.user_id, COUNT(users.user_id) FROM games INNER JOIN users ON games.
 
 func GetLoxes(db *sql.DB, chatId int64) ([]GotLucky, error) {
 	statement := `
-SELECT users.user_id, COUNT(users.user_id) FROM games INNER JOIN users ON games.lox_id = users.id WHERE games.chat_id = $1 GROUP BY games.lox_id;
+SELECT users.user_id, COUNT(users.user_id) as got_unlucky FROM games INNER JOIN users ON games.lox_id = users.id WHERE games.chat_id = $1 GROUP BY games.lox_id ORDER BY got_unlucky;
 `
 	rows, err := db.Query(statement, chatId)
 	defer func(rows *sql.Rows) {
