@@ -16,8 +16,7 @@ import (
 	"desolidify.ru/lox-bot/internal/storage"
 )
 
-// waitTime is the pause between the suspense messages in /run and /lox. It is a
-// var rather than a const so tests can shorten it to zero.
+// waitTime is a var, not a const, so tests can shorten it to zero.
 var waitTime = 2 * time.Second
 
 func sendMessage(ctx context.Context, b *bot.Bot, log *slog.Logger, chatID int64, text string) bool {
@@ -204,7 +203,6 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 			return
 		}
 
-		// No winner yet: we need active players to pick one.
 		players, err := storage.GetAllPlayers(db, chatId)
 		if err != nil {
 			log.Error("DB failed to get players in chat", "chat_id", chatId, "err", err.Error())
@@ -277,7 +275,6 @@ func handleLoxRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, 
 			return
 		}
 
-		// No lox yet: we need active players to pick one.
 		players, err := storage.GetAllPlayers(db, chatId)
 		if err != nil {
 			log.Error("DB failed to get players in chat", "chat_id", chatId, "err", err.Error())
@@ -352,14 +349,9 @@ func getPlayerInfo(ctx context.Context, b *bot.Bot, log *slog.Logger, userId int
 	return nil, false
 }
 
-// resolveName returns a player's display name and always yields something
-// usable, so a command never aborts silently. Precedence:
-//  1. the name captured by NameMiddleware (the normal path);
-//  2. a live Telegram lookup, used only while no stored name exists yet — this
-//     requires the bot to be a chat admin;
-//  3. a placeholder, when neither is available (e.g. admin was turned off
-//     before the player ever interacted). The placeholder self-heals: the
-//     middleware records the real name the next time the player uses the bot.
+// resolveName always yields a usable name so a command never aborts silently:
+// the stored name, else a live Telegram lookup (needs admin), else a
+// placeholder. A placeholder self-heals once the player next uses the bot.
 func resolveName(ctx context.Context, b *bot.Bot, db *sql.DB, log *slog.Logger, userId int64, chatId int64) (firstName, lastName string) {
 	fn, ln, found, err := storage.GetUserNameDB(db, userId, chatId)
 	if err != nil {
@@ -437,9 +429,8 @@ func handleLoxStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot
 	}
 }
 
-// NameMiddleware records the sender's current Telegram name on every incoming
-// message, so stored player names stay fresh as people rename themselves. It
-// only updates already-registered users; unknown senders are left untouched.
+// NameMiddleware keeps stored names fresh by recording the sender's name on
+// each message. It only updates already-registered users; it never creates one.
 func NameMiddleware(db *sql.DB, log *slog.Logger) bot.Middleware {
 	return func(next bot.HandlerFunc) bot.HandlerFunc {
 		return func(ctx context.Context, b *bot.Bot, update *models.Update) {
@@ -454,14 +445,12 @@ func NameMiddleware(db *sql.DB, log *slog.Logger) bot.Middleware {
 	}
 }
 
-// handleAddFake registers a synthetic player named by the command argument
-// (e.g. "/addfake Вася"), so a single tester can fill a chat with players. It
-// is only wired up when debug commands are enabled.
+// handleAddFake adds a synthetic player named by the command argument, e.g.
+// "/addfake Вася", so one tester can fill a chat.
 func handleAddFake(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
 	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		chatId := update.Message.Chat.ID
 
-		// Everything after the command word is the player's name.
 		name := ""
 		if parts := strings.SplitN(update.Message.Text, " ", 2); len(parts) == 2 {
 			name = strings.TrimSpace(parts[1])
@@ -481,8 +470,6 @@ func handleAddFake(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot,
 	}
 }
 
-// handleNextDay advances the bot's simulated "today" by one day so a new game
-// can be started without waiting for the calendar. Debug-only.
 func handleNextDay(log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
 	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		date := storage.AdvanceDay()
@@ -490,8 +477,6 @@ func handleNextDay(log *slog.Logger) func(context.Context, *bot.Bot, *models.Upd
 	}
 }
 
-// handleResetDay restores the simulated "today" to the real current date.
-// Debug-only.
 func handleResetDay(log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
 	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		date := storage.ResetDay()

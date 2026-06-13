@@ -12,26 +12,20 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// dayOffset shifts the bot's notion of "today" by a number of days. It is zero
-// in production; debug commands move it to simulate multiple days so stats can
-// be tested without waiting for the calendar.
+// dayOffset shifts "today" for testing; it is zero in production. Games are
+// keyed by date, so moving it starts a new day's game.
 var dayOffset atomic.Int64
 
-// currentDate returns today's date (YYYY-MM-DD), adjusted by dayOffset. Games
-// are keyed by this string, so advancing the offset starts a new day's game.
 func currentDate() string {
 	year, month, day := time.Now().AddDate(0, 0, int(dayOffset.Load())).Date()
 	return fmt.Sprintf("%d-%02d-%02d", year, int(month), day)
 }
 
-// AdvanceDay moves the simulated "today" forward by one day and returns the new
-// date. Testing aid only.
 func AdvanceDay() string {
 	dayOffset.Add(1)
 	return currentDate()
 }
 
-// ResetDay restores "today" to the real current date and returns it.
 func ResetDay() string {
 	dayOffset.Store(0)
 	return currentDate()
@@ -59,9 +53,8 @@ func CreateConnection() (*sql.DB, error) {
 	return Open(filepath.Join(dir, "database", "database.sqlite"))
 }
 
-// Open opens (or creates) the SQLite database at path and ensures the schema
-// exists. It is the path-explicit core of CreateConnection, exposed so tests
-// can point at a temporary database.
+// Open is the path-explicit core of CreateConnection, exposed so tests can
+// point at a temporary database.
 func Open(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -186,10 +179,9 @@ VALUES ($1, $2, $3, $4);
 	return err
 }
 
-// AddFakeUser registers a synthetic player for testing and returns its id. Real
-// Telegram user ids are positive, so fakes get negative ids (each one below the
-// chat's current minimum) to avoid colliding with real users. The stored name
-// is what gets displayed, since a fake has no Telegram identity to look up.
+// AddFakeUser registers a synthetic test player. Real Telegram ids are
+// positive, so fakes get negative ids (below the chat's current minimum) to
+// avoid colliding with real users.
 func AddFakeUser(db *sql.DB, chatId int64, firstName, lastName string) (int64, error) {
 	var minID sql.NullInt64
 	if err := db.QueryRow(`SELECT MIN(user_id) FROM users WHERE chat_id = $1;`, chatId).Scan(&minID); err != nil {
@@ -208,8 +200,7 @@ func AddFakeUser(db *sql.DB, chatId int64, firstName, lastName string) (int64, e
 	return newID, nil
 }
 
-// UpdateUserName refreshes the stored Telegram name for an existing player. It
-// updates nothing if the user is not registered in the chat.
+// UpdateUserName updates nothing if the user is not registered in the chat.
 func UpdateUserName(db *sql.DB, userId int64, chatId int64, firstName, lastName string) error {
 	statement := `
 UPDATE users SET first_name = $1, last_name = $2 WHERE user_id = $3 AND chat_id = $4;
