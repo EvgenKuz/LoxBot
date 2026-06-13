@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -488,6 +489,69 @@ func TestHandleRunAnnouncesExistingWinner(t *testing.T) {
 	}
 	if got := api.lastMessage(t); !strings.Contains(got.text, "Красавчик Дня") {
 		t.Fatalf("expected existing-winner announcement, got %q", got.text)
+	}
+}
+
+// TestHandleRunAvoidsTodaysLox checks that with multiple players the winner is
+// not whoever is already today's lox.
+func TestHandleRunAvoidsTodaysLox(t *testing.T) {
+	b, _ := newBot(t)
+	db := testDB(t)
+	const loxID, otherID, chatID = int64(1), int64(2), int64(100)
+
+	if err := storage.AddUser(db, loxID, chatID, "Lox", ""); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	if err := storage.AddUser(db, otherID, chatID, "Other", ""); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	if _, err := storage.GetTodayGame(db, chatID); err != nil {
+		t.Fatalf("GetTodayGame: %v", err)
+	}
+	if _, err := storage.AddLox(db, loxID, chatID); err != nil {
+		t.Fatalf("AddLox: %v", err)
+	}
+
+	handleRun(db, discardLogger())(context.Background(), b, msg(otherID, chatID))
+
+	game := mustGame(t, db, chatID)
+	if game.WinTelegramId == nil || *game.WinTelegramId != otherID {
+		t.Fatalf("winner = %v, want %d (must not be today's lox)", game.WinTelegramId, otherID)
+	}
+}
+
+// TestHandleRunSinglePlayerWhoIsLoxTerminates guards the len(players)==1 break:
+// the only player can be both lox and winner, and /run must not loop forever
+// trying to avoid them.
+func TestHandleRunSinglePlayerWhoIsLoxTerminates(t *testing.T) {
+	b, _ := newBot(t)
+	db := testDB(t)
+	const userID, chatID = int64(1), int64(100)
+
+	if err := storage.AddUser(db, userID, chatID, "Solo", ""); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	if _, err := storage.GetTodayGame(db, chatID); err != nil {
+		t.Fatalf("GetTodayGame: %v", err)
+	}
+	if _, err := storage.AddLox(db, userID, chatID); err != nil {
+		t.Fatalf("AddLox: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		handleRun(db, discardLogger())(context.Background(), b, msg(userID, chatID))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleRun hung with a single player who is already the lox")
+	}
+
+	game := mustGame(t, db, chatID)
+	if game.WinTelegramId == nil || *game.WinTelegramId != userID {
+		t.Fatalf("winner = %v, want %d (the only player)", game.WinTelegramId, userID)
 	}
 }
 
