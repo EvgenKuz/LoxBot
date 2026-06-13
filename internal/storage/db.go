@@ -58,7 +58,9 @@ CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL,
     chat_id INTEGER NOT NULL ,
-    active BOOLEAN NOT NULL DEFAULT TRUE
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    first_name TEXT,
+    last_name TEXT
 );
 
 CREATE TABLE IF NOT EXISTS games (
@@ -67,14 +69,54 @@ CREATE TABLE IF NOT EXISTS games (
     date TEXT NOT NULL,
     lox_id INTEGER,
     winner_id INTEGER,
-                                 
+
 	FOREIGN KEY (lox_id) REFERENCES users(id),
 	FOREIGN KEY (winner_id) REFERENCES users(id)
 )
 `
-	_, err := db.Exec(query)
+	if _, err := db.Exec(query); err != nil {
+		return err
+	}
 
-	return err
+	return ensureUserNameColumns(db)
+}
+
+// ensureUserNameColumns adds the first_name/last_name columns to databases
+// created before names were stored. CREATE TABLE IF NOT EXISTS never alters an
+// existing table, so older databases need this migration. It is idempotent.
+func ensureUserNameColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(users);`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	existing := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			name, ctype      string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, col := range []string{"first_name", "last_name"} {
+		if existing[col] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE users ADD COLUMN ` + col + ` TEXT;`); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func GetTodayGame(db *sql.DB, chatId int64) (Game, error) {
@@ -110,14 +152,38 @@ INSERT INTO games (chat_id, date, lox_id, winner_id) VALUES ($1, $2, null, null)
 	return Game{chatId, dateFormated, nil, nil}, nil
 }
 
-func AddUser(db *sql.DB, userId int64, chatId int64) error {
+func AddUser(db *sql.DB, userId int64, chatId int64, firstName, lastName string) error {
 	statement := `
-INSERT INTO users (user_id, chat_id)
-VALUES ($1, $2);
+INSERT INTO users (user_id, chat_id, first_name, last_name)
+VALUES ($1, $2, $3, $4);
 `
-	_, err := db.Exec(statement, userId, chatId)
+	_, err := db.Exec(statement, userId, chatId, firstName, lastName)
 
 	return err
+}
+
+// UpdateUserName refreshes the stored Telegram name for an existing player. It
+// updates nothing if the user is not registered in the chat.
+func UpdateUserName(db *sql.DB, userId int64, chatId int64, firstName, lastName string) error {
+	statement := `
+UPDATE users SET first_name = $1, last_name = $2 WHERE user_id = $3 AND chat_id = $4;
+`
+	_, err := db.Exec(statement, firstName, lastName, userId, chatId)
+
+	return err
+}
+
+func GetUserNameDB(db *sql.DB, userId int64, chatId int64) (firstName, lastName string, ok bool, err error) {
+	var fn, ln sql.NullString
+	row := db.QueryRow(`SELECT first_name, last_name FROM users WHERE user_id = $1 AND chat_id = $2;`, userId, chatId)
+	switch scanErr := row.Scan(&fn, &ln); {
+	case errors.Is(scanErr, sql.ErrNoRows):
+		return "", "", false, nil
+	case scanErr != nil:
+		return "", "", false, scanErr
+	}
+
+	return fn.String, ln.String, true, nil
 }
 
 // AddWinner records the winner for today's game in the chat, but only if one has

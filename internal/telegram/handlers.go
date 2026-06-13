@@ -52,7 +52,7 @@ func handlerRegister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bo
 		}
 
 		if !exists {
-			err = storage.AddUser(db, userId, chatId)
+			err = storage.AddUser(db, userId, chatId, update.Message.From.FirstName, update.Message.From.LastName)
 			if err != nil {
 				log.Error("DB failed to add user", "user_id", userId, "chat_id", chatId, "err", err.Error())
 				return
@@ -192,13 +192,7 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 			return
 		}
 		if game.WinTelegramId != nil {
-			player, got := getPlayerInfo(ctx, b, log, *game.WinTelegramId, chatId)
-			if !got {
-				return
-			}
-
-			firstName := player.FirstName
-			lastName := player.LastName
+			firstName, lastName := resolveName(ctx, b, db, log, *game.WinTelegramId, chatId)
 			var message string
 			if lastName == "" {
 				message = fmt.Sprintf("Сегодня Красавчик Дня %s!", firstName)
@@ -240,13 +234,7 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 			return
 		}
 
-		player, got := getPlayerInfo(ctx, b, log, chosenPlayerId, chatId)
-		if !got {
-			return
-		}
-
-		firstName := player.FirstName
-		lastName := player.LastName
+		firstName, lastName := resolveName(ctx, b, db, log, chosenPlayerId, chatId)
 		var message string
 		if lastName == "" {
 			message = fmt.Sprintf("Сегодня Красавчик дня...\n\n%s!!!", firstName)
@@ -277,13 +265,7 @@ func handleLoxRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, 
 			return
 		}
 		if game.LoxTelegramId != nil {
-			player, got := getPlayerInfo(ctx, b, log, *game.LoxTelegramId, chatId)
-			if !got {
-				return
-			}
-
-			firstName := player.FirstName
-			lastName := player.LastName
+			firstName, lastName := resolveName(ctx, b, db, log, *game.LoxTelegramId, chatId)
 			var message string
 			if lastName == "" {
 				message = fmt.Sprintf("Сегодня Лох Дня %s!", firstName)
@@ -324,12 +306,7 @@ func handleLoxRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, 
 			return
 		}
 
-		player, got := getPlayerInfo(ctx, b, log, chosenPlayerId, chatId)
-		if !got {
-			return
-		}
-		firstName := player.FirstName
-		lastName := player.LastName
+		firstName, lastName := resolveName(ctx, b, db, log, chosenPlayerId, chatId)
 		var message string
 		if lastName == "" {
 			message = fmt.Sprintf("Сегодня Лох дня...\n\n%s!!!", firstName)
@@ -375,6 +352,37 @@ func getPlayerInfo(ctx context.Context, b *bot.Bot, log *slog.Logger, userId int
 	return nil, false
 }
 
+// resolveName returns a player's display name and always yields something
+// usable, so a command never aborts silently. Precedence:
+//  1. the name captured by NameMiddleware (the normal path);
+//  2. a live Telegram lookup, used only while no stored name exists yet — this
+//     requires the bot to be a chat admin;
+//  3. a placeholder, when neither is available (e.g. admin was turned off
+//     before the player ever interacted). The placeholder self-heals: the
+//     middleware records the real name the next time the player uses the bot.
+func resolveName(ctx context.Context, b *bot.Bot, db *sql.DB, log *slog.Logger, userId int64, chatId int64) (firstName, lastName string) {
+	fn, ln, found, err := storage.GetUserNameDB(db, userId, chatId)
+	if err != nil {
+		log.Error("DB failed to get stored user name", "user_id", userId, "chat_id", chatId, "err", err.Error())
+	}
+	if found && fn != "" {
+		return fn, ln
+	}
+
+	if player, got := getPlayerInfo(ctx, b, log, userId, chatId); got {
+		return player.FirstName, player.LastName
+	}
+
+	return fmt.Sprintf("Игрок #%04d", abs(userId)%10000), ""
+}
+
+func abs(n int64) int64 {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
 func handleStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
 	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		chatId := update.Message.Chat.ID
@@ -387,12 +395,7 @@ func handleStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *
 		var message strings.Builder
 		message.WriteString("Был Красавчиком Дня:\n")
 		for _, result := range results {
-			player, got := getPlayerInfo(ctx, b, log, result.UserId, chatId)
-			if !got {
-				return
-			}
-			firstName := player.FirstName
-			lastName := player.LastName
+			firstName, lastName := resolveName(ctx, b, db, log, result.UserId, chatId)
 
 			var line string
 			if lastName == "" {
@@ -419,12 +422,7 @@ func handleLoxStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot
 		var message strings.Builder
 		message.WriteString("Был Лохом Дня:\n")
 		for _, result := range results {
-			player, got := getPlayerInfo(ctx, b, log, result.UserId, chatId)
-			if !got {
-				return
-			}
-			firstName := player.FirstName
-			lastName := player.LastName
+			firstName, lastName := resolveName(ctx, b, db, log, result.UserId, chatId)
 
 			var line string
 			if lastName == "" {
@@ -436,6 +434,23 @@ func handleLoxStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot
 		}
 
 		sendMessage(ctx, b, log, chatId, message.String())
+	}
+}
+
+// NameMiddleware records the sender's current Telegram name on every incoming
+// message, so stored player names stay fresh as people rename themselves. It
+// only updates already-registered users; unknown senders are left untouched.
+func NameMiddleware(db *sql.DB, log *slog.Logger) bot.Middleware {
+	return func(next bot.HandlerFunc) bot.HandlerFunc {
+		return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+			if update.Message != nil && update.Message.From != nil {
+				from := update.Message.From
+				if err := storage.UpdateUserName(db, from.ID, update.Message.Chat.ID, from.FirstName, from.LastName); err != nil {
+					log.Error("Failed to update stored user name", "user_id", from.ID, "chat_id", update.Message.Chat.ID, "err", err.Error())
+				}
+			}
+			next(ctx, b, update)
+		}
 	}
 }
 

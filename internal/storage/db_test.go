@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -38,7 +39,7 @@ func TestAddUserAndExists(t *testing.T) {
 		t.Fatal("user should not exist before being added")
 	}
 
-	if err := AddUser(db, userID, chatID); err != nil {
+	if err := AddUser(db, userID, chatID, "Test", ""); err != nil {
 		t.Fatalf("AddUser: %v", err)
 	}
 
@@ -64,7 +65,7 @@ func TestActivateDeactivate(t *testing.T) {
 	db := newTestDB(t)
 	const userID, chatID = int64(1), int64(2)
 
-	if err := AddUser(db, userID, chatID); err != nil {
+	if err := AddUser(db, userID, chatID, "Test", ""); err != nil {
 		t.Fatalf("AddUser: %v", err)
 	}
 
@@ -338,11 +339,138 @@ func TestGetWinnersEmpty(t *testing.T) {
 	}
 }
 
+func TestAddUserStoresName(t *testing.T) {
+	db := newTestDB(t)
+	const userID, chatID = int64(1), int64(2)
+
+	if err := AddUser(db, userID, chatID, "Иван", "Петров"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+
+	fn, ln, ok, err := GetUserNameDB(db, userID, chatID)
+	if err != nil {
+		t.Fatalf("GetUserNameDB: %v", err)
+	}
+	if !ok {
+		t.Fatal("user should be found")
+	}
+	if fn != "Иван" || ln != "Петров" {
+		t.Fatalf("stored name = %q %q, want Иван Петров", fn, ln)
+	}
+}
+
+func TestUpdateUserName(t *testing.T) {
+	db := newTestDB(t)
+	const userID, chatID = int64(1), int64(2)
+
+	if err := AddUser(db, userID, chatID, "Old", "Name"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	if err := UpdateUserName(db, userID, chatID, "New", "Surname"); err != nil {
+		t.Fatalf("UpdateUserName: %v", err)
+	}
+
+	fn, ln, _, err := GetUserNameDB(db, userID, chatID)
+	if err != nil {
+		t.Fatalf("GetUserNameDB: %v", err)
+	}
+	if fn != "New" || ln != "Surname" {
+		t.Fatalf("stored name = %q %q, want New Surname", fn, ln)
+	}
+}
+
+// TestUpdateUserNameDoesNotCreateUser ensures the name-refresh path never
+// registers a new user: updating an unknown user is a no-op.
+func TestUpdateUserNameDoesNotCreateUser(t *testing.T) {
+	db := newTestDB(t)
+	const userID, chatID = int64(99), int64(2)
+
+	if err := UpdateUserName(db, userID, chatID, "Ghost", ""); err != nil {
+		t.Fatalf("UpdateUserName: %v", err)
+	}
+
+	exists, err := UserExists(db, userID, chatID)
+	if err != nil {
+		t.Fatalf("UserExists: %v", err)
+	}
+	if exists {
+		t.Fatal("UpdateUserName must not create a user row")
+	}
+}
+
+func TestGetUserNameMissing(t *testing.T) {
+	db := newTestDB(t)
+
+	_, _, ok, err := GetUserNameDB(db, 1, 2)
+	if err != nil {
+		t.Fatalf("GetUserNameDB: %v", err)
+	}
+	if ok {
+		t.Fatal("ok should be false for an unregistered user")
+	}
+}
+
+// TestNameColumnsMigrateOldSchema verifies that a database created before names
+// were stored gains the columns (without losing existing rows) when the schema
+// setup runs against it.
+func TestNameColumnsMigrateOldSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Pre-names schema: users table without first_name/last_name.
+	_, err = db.Exec(`CREATE TABLE users (
+		id INTEGER PRIMARY KEY,
+		user_id INTEGER NOT NULL,
+		chat_id INTEGER NOT NULL,
+		active BOOLEAN NOT NULL DEFAULT TRUE
+	);`)
+	if err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO users (user_id, chat_id) VALUES (7, 8);`); err != nil {
+		t.Fatalf("insert legacy user: %v", err)
+	}
+
+	// Running schema setup should migrate the table in place.
+	if err := createTables(db); err != nil {
+		t.Fatalf("createTables (migration): %v", err)
+	}
+
+	// The legacy user survives, with empty (not missing) name columns...
+	fn, ln, ok, err := GetUserNameDB(db, 7, 8)
+	if err != nil {
+		t.Fatalf("GetUserNameDB: %v", err)
+	}
+	if !ok {
+		t.Fatal("legacy user should still exist after migration")
+	}
+	if fn != "" || ln != "" {
+		t.Fatalf("legacy name = %q %q, want empty", fn, ln)
+	}
+
+	// ...and the new columns are usable.
+	if err := UpdateUserName(db, 7, 8, "Backfilled", ""); err != nil {
+		t.Fatalf("UpdateUserName after migration: %v", err)
+	}
+	if fn, _, _, _ := GetUserNameDB(db, 7, 8); fn != "Backfilled" {
+		t.Fatalf("name after backfill = %q, want Backfilled", fn)
+	}
+
+	// Migration is idempotent: running it again must not error.
+	if err := createTables(db); err != nil {
+		t.Fatalf("createTables (second run): %v", err)
+	}
+}
+
 // --- helpers ---
 
 func mustAddUser(t *testing.T, db *sql.DB, userID, chatID int64) {
 	t.Helper()
-	if err := AddUser(db, userID, chatID); err != nil {
+	if err := AddUser(db, userID, chatID, fmt.Sprintf("User%d", userID), ""); err != nil {
 		t.Fatalf("AddUser(%d, %d): %v", userID, chatID, err)
 	}
 }

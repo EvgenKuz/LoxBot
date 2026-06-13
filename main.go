@@ -45,7 +45,10 @@ func main() {
 	}
 	apiKey := uuid.New().String()
 
-	b, err := bot.New(botKey, bot.WithWebhookSecretToken(apiKey))
+	b, err := bot.New(botKey,
+		bot.WithWebhookSecretToken(apiKey),
+		bot.WithMiddlewares(telegram.NameMiddleware(db, log)),
+	)
 	if err != nil || b == nil {
 		log.Error("Failed to create bot", "err", err)
 		return

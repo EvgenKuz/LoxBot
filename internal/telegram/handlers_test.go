@@ -36,9 +36,11 @@ type sentMessage struct {
 
 // fakeAPI impersonates the Telegram Bot API. It records sendMessage calls and
 // answers getChatMember with a synthetic user derived from the requested id.
+// Set failChatMember to simulate the bot lacking admin rights.
 type fakeAPI struct {
-	mu       sync.Mutex
-	messages []sentMessage
+	mu             sync.Mutex
+	messages       []sentMessage
+	failChatMember bool
 }
 
 func (f *fakeAPI) handler(w http.ResponseWriter, r *http.Request) {
@@ -55,6 +57,11 @@ func (f *fakeAPI) handler(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1}}`)
 
 	case "getChatMember":
+		if f.failChatMember {
+			// As Telegram does when a non-admin bot queries another member.
+			_, _ = io.WriteString(w, `{"ok":false,"error_code":403,"description":"Forbidden"}`)
+			return
+		}
 		userID, _ := strconv.ParseInt(r.FormValue("user_id"), 10, 64)
 		// Name the user deterministically so tests can assert on it.
 		_, _ = fmt.Fprintf(w,
@@ -117,6 +124,134 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+func TestResolveNamePrefersStoredName(t *testing.T) {
+	b, api := newBot(t)
+	db := testDB(t)
+	const userID, chatID = int64(50), int64(100)
+
+	if err := storage.AddUser(db, userID, chatID, "Stored", "Name"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	// Even with the API unavailable, the stored name is used.
+	api.failChatMember = true
+
+	fn, ln := resolveName(context.Background(), b, db, discardLogger(), userID, chatID)
+	if fn != "Stored" || ln != "Name" {
+		t.Fatalf("resolved %q %q, want Stored Name", fn, ln)
+	}
+}
+
+func TestResolveNameFallsBackToLiveLookup(t *testing.T) {
+	b, _ := newBot(t)
+	db := testDB(t)
+	const userID, chatID = int64(50), int64(100)
+
+	// Registered, but no name captured yet -> live lookup (fake returns User<id>).
+	if err := storage.AddUser(db, userID, chatID, "", ""); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+
+	fn, _ := resolveName(context.Background(), b, db, discardLogger(), userID, chatID)
+	if fn != "User50" {
+		t.Fatalf("resolved %q, want User50 from live lookup", fn)
+	}
+}
+
+// TestResolveNameFallsBackToPlaceholder covers the "admin turned off too early"
+// case: no stored name and the live lookup fails. resolveName must still return
+// a usable placeholder rather than nothing.
+func TestResolveNameFallsBackToPlaceholder(t *testing.T) {
+	b, api := newBot(t)
+	db := testDB(t)
+	const userID, chatID = int64(12347734), int64(100)
+
+	if err := storage.AddUser(db, userID, chatID, "", ""); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	api.failChatMember = true
+
+	fn, ln := resolveName(context.Background(), b, db, discardLogger(), userID, chatID)
+	if fn != "Игрок #7734" || ln != "" {
+		t.Fatalf("resolved %q %q, want \"Игрок #7734\" \"\"", fn, ln)
+	}
+}
+
+// TestHandleStatsShowsPlaceholderWithoutAdmin is the end-to-end guarantee: with
+// no admin and an un-captured player, /stats still posts a complete list using
+// the placeholder, instead of silently aborting.
+func TestHandleStatsShowsPlaceholderWithoutAdmin(t *testing.T) {
+	b, api := newBot(t)
+	db := testDB(t)
+	const userID, chatID = int64(12347734), int64(100)
+
+	if err := storage.AddUser(db, userID, chatID, "", ""); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	if _, err := storage.GetTodayGame(db, chatID); err != nil {
+		t.Fatalf("GetTodayGame: %v", err)
+	}
+	if _, err := storage.AddWinner(db, userID, chatID); err != nil {
+		t.Fatalf("AddWinner: %v", err)
+	}
+	api.failChatMember = true
+
+	handleStats(db, discardLogger())(context.Background(), b, msg(userID, chatID))
+
+	got := api.lastMessage(t)
+	if !strings.Contains(got.text, "Был Красавчиком Дня") {
+		t.Fatalf("stats header missing (handler aborted?): %q", got.text)
+	}
+	if !strings.Contains(got.text, "Игрок #7734") {
+		t.Fatalf("expected placeholder in stats, got %q", got.text)
+	}
+}
+
+func TestNameMiddlewareUpdatesRegisteredUser(t *testing.T) {
+	db := testDB(t)
+	const userID, chatID = int64(50), int64(100)
+
+	if err := storage.AddUser(db, userID, chatID, "Old", "Name"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+
+	called := false
+	next := func(ctx context.Context, b *bot.Bot, u *models.Update) { called = true }
+
+	update := msg(userID, chatID)
+	update.Message.From.FirstName = "Fresh"
+	update.Message.From.LastName = "Identity"
+	NameMiddleware(db, discardLogger())(next)(context.Background(), nil, update)
+
+	if !called {
+		t.Fatal("middleware must call the next handler")
+	}
+	fn, ln, _, err := storage.GetUserNameDB(db, userID, chatID)
+	if err != nil {
+		t.Fatalf("GetUserNameDB: %v", err)
+	}
+	if fn != "Fresh" || ln != "Identity" {
+		t.Fatalf("stored name = %q %q, want Fresh Identity", fn, ln)
+	}
+}
+
+// TestNameMiddlewareDoesNotCreateUser is the behavior the bot relies on: the
+// middleware refreshes names but never registers someone who only chatted.
+func TestNameMiddlewareDoesNotCreateUser(t *testing.T) {
+	db := testDB(t)
+	const userID, chatID = int64(50), int64(100)
+
+	next := func(ctx context.Context, b *bot.Bot, u *models.Update) {}
+	NameMiddleware(db, discardLogger())(next)(context.Background(), nil, msg(userID, chatID))
+
+	exists, err := storage.UserExists(db, userID, chatID)
+	if err != nil {
+		t.Fatalf("UserExists: %v", err)
+	}
+	if exists {
+		t.Fatal("middleware must not register an unregistered sender")
+	}
+}
+
 func TestHandlerStartSendsWelcome(t *testing.T) {
 	b, api := newBot(t)
 	log := discardLogger()
@@ -158,7 +293,7 @@ func TestHandlerRegisterAlreadyActive(t *testing.T) {
 	db := testDB(t)
 	const userID, chatID = int64(42), int64(100)
 
-	if err := storage.AddUser(db, userID, chatID); err != nil {
+	if err := storage.AddUser(db, userID, chatID, fmt.Sprintf("User%d", userID), ""); err != nil {
 		t.Fatalf("AddUser: %v", err)
 	}
 
@@ -185,7 +320,7 @@ func TestHandleUnregisterDeactivates(t *testing.T) {
 	db := testDB(t)
 	const userID, chatID = int64(7), int64(100)
 
-	if err := storage.AddUser(db, userID, chatID); err != nil {
+	if err := storage.AddUser(db, userID, chatID, fmt.Sprintf("User%d", userID), ""); err != nil {
 		t.Fatalf("AddUser: %v", err)
 	}
 
@@ -219,7 +354,7 @@ func TestHandleRunPicksAndRecordsWinner(t *testing.T) {
 	db := testDB(t)
 	const userID, chatID = int64(77), int64(100)
 
-	if err := storage.AddUser(db, userID, chatID); err != nil {
+	if err := storage.AddUser(db, userID, chatID, fmt.Sprintf("User%d", userID), ""); err != nil {
 		t.Fatalf("AddUser: %v", err)
 	}
 
@@ -246,7 +381,7 @@ func TestHandleRunAnnouncesExistingWinner(t *testing.T) {
 	db := testDB(t)
 	const userID, chatID = int64(77), int64(100)
 
-	if err := storage.AddUser(db, userID, chatID); err != nil {
+	if err := storage.AddUser(db, userID, chatID, fmt.Sprintf("User%d", userID), ""); err != nil {
 		t.Fatalf("AddUser: %v", err)
 	}
 	// First run picks the winner.
@@ -272,7 +407,7 @@ func TestHandleRunShowsResultAfterAllLeft(t *testing.T) {
 	db := testDB(t)
 	const userID, chatID = int64(77), int64(100)
 
-	if err := storage.AddUser(db, userID, chatID); err != nil {
+	if err := storage.AddUser(db, userID, chatID, fmt.Sprintf("User%d", userID), ""); err != nil {
 		t.Fatalf("AddUser: %v", err)
 	}
 	// Decide the winner, then the only player leaves.
@@ -292,7 +427,7 @@ func TestHandleLoxRunShowsResultAfterAllLeft(t *testing.T) {
 	db := testDB(t)
 	const userID, chatID = int64(88), int64(100)
 
-	if err := storage.AddUser(db, userID, chatID); err != nil {
+	if err := storage.AddUser(db, userID, chatID, fmt.Sprintf("User%d", userID), ""); err != nil {
 		t.Fatalf("AddUser: %v", err)
 	}
 	handleLoxRun(db, discardLogger())(context.Background(), b, msg(userID, chatID))
@@ -310,7 +445,7 @@ func TestHandleStatsListsWinners(t *testing.T) {
 	db := testDB(t)
 	const chatID = int64(100)
 
-	if err := storage.AddUser(db, 5, chatID); err != nil {
+	if err := storage.AddUser(db, 5, chatID, "User5", ""); err != nil {
 		t.Fatalf("AddUser: %v", err)
 	}
 	if _, err := storage.GetTodayGame(db, chatID); err != nil {
