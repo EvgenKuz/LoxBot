@@ -454,7 +454,34 @@ func NameMiddleware(db *sql.DB, log *slog.Logger) bot.Middleware {
 	}
 }
 
-func RegisterHandlers(b *bot.Bot, db *sql.DB, log *slog.Logger) {
+// handleAddFake registers a synthetic player named by the command argument
+// (e.g. "/addfake Вася"), so a single tester can fill a chat with players. It
+// is only wired up when debug commands are enabled.
+func handleAddFake(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
+	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		chatId := update.Message.Chat.ID
+
+		// Everything after the command word is the player's name.
+		name := ""
+		if parts := strings.SplitN(update.Message.Text, " ", 2); len(parts) == 2 {
+			name = strings.TrimSpace(parts[1])
+		}
+		if name == "" {
+			sendMessage(ctx, b, log, chatId, "Использование: /addfake <имя>")
+			return
+		}
+
+		id, err := storage.AddFakeUser(db, chatId, name, "")
+		if err != nil {
+			log.Error("DB failed to add fake user", "chat_id", chatId, "err", err.Error())
+			return
+		}
+
+		sendMessage(ctx, b, log, chatId, fmt.Sprintf("Добавлен тестовый игрок %s (id %d)", name, id))
+	}
+}
+
+func RegisterHandlers(b *bot.Bot, db *sql.DB, log *slog.Logger, debug bool) {
 	re := regexp.MustCompile("^/start(?:@.+)?$")
 	b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handlerStart(log))
 	re = regexp.MustCompile("^/register(?:@.+)?$")
@@ -469,4 +496,10 @@ func RegisterHandlers(b *bot.Bot, db *sql.DB, log *slog.Logger) {
 	b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleStats(db, log))
 	re = regexp.MustCompile("^/loxstats(?:@.+)?$")
 	b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleLoxStats(db, log))
+
+	// Testing-only commands, gated so they never reach production.
+	if debug {
+		re = regexp.MustCompile(`^/addfake(?:@\S+)?(?:\s.*)?$`)
+		b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleAddFake(db, log))
+	}
 }

@@ -53,7 +53,8 @@ func main() {
 		log.Error("Failed to create bot", "err", err)
 		return
 	}
-	telegram.RegisterHandlers(b, db, log)
+	debugCommands := os.Getenv("DEBUG_COMMANDS") != ""
+	telegram.RegisterHandlers(b, db, log, debugCommands)
 
 	_, err = b.SetWebhook(ctx, &bot.SetWebhookParams{
 		URL:         webhookURL,

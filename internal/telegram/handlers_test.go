@@ -206,6 +206,70 @@ func TestHandleStatsShowsPlaceholderWithoutAdmin(t *testing.T) {
 	}
 }
 
+func TestHandleAddFake(t *testing.T) {
+	b, api := newBot(t)
+	db := testDB(t)
+	const chatID = int64(100)
+
+	update := msg(1, chatID)
+	update.Message.Text = "/addfake Вася"
+	handleAddFake(db, discardLogger())(context.Background(), b, update)
+
+	players, err := storage.GetAllPlayers(db, chatID)
+	if err != nil {
+		t.Fatalf("GetAllPlayers: %v", err)
+	}
+	if len(players) != 1 || players[0] >= 0 {
+		t.Fatalf("expected one fake (negative-id) player, got %v", players)
+	}
+	if fn, _, _, _ := storage.GetUserNameDB(db, players[0], chatID); fn != "Вася" {
+		t.Fatalf("fake name = %q, want Вася", fn)
+	}
+	if got := api.lastMessage(t); !strings.Contains(got.text, "Вася") {
+		t.Fatalf("expected confirmation naming the fake, got %q", got.text)
+	}
+}
+
+func TestHandleAddFakeNoName(t *testing.T) {
+	b, api := newBot(t)
+	db := testDB(t)
+	const chatID = int64(100)
+
+	update := msg(1, chatID)
+	update.Message.Text = "/addfake"
+	handleAddFake(db, discardLogger())(context.Background(), b, update)
+
+	players, err := storage.GetAllPlayers(db, chatID)
+	if err != nil {
+		t.Fatalf("GetAllPlayers: %v", err)
+	}
+	if len(players) != 0 {
+		t.Fatalf("no player should be added without a name, got %v", players)
+	}
+	if got := api.lastMessage(t); !strings.Contains(got.text, "Использование") {
+		t.Fatalf("expected usage message, got %q", got.text)
+	}
+}
+
+// TestFakeUserPlaysWithoutAdmin proves the point of fakes: a synthetic player
+// is pickable and announced by its stored name, with no Telegram lookup.
+func TestFakeUserPlaysWithoutAdmin(t *testing.T) {
+	b, api := newBot(t)
+	db := testDB(t)
+	const chatID = int64(100)
+	api.failChatMember = true // a fake has no Telegram identity to look up
+
+	if _, err := storage.AddFakeUser(db, chatID, "Вася", ""); err != nil {
+		t.Fatalf("AddFakeUser: %v", err)
+	}
+
+	handleRun(db, discardLogger())(context.Background(), b, msg(1, chatID))
+
+	if got := api.lastMessage(t); !strings.Contains(got.text, "Вася") {
+		t.Fatalf("expected fake to be announced by name, got %q", got.text)
+	}
+}
+
 func TestNameMiddlewareUpdatesRegisteredUser(t *testing.T) {
 	db := testDB(t)
 	const userID, chatID = int64(50), int64(100)

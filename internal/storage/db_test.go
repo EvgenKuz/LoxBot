@@ -466,6 +466,57 @@ func TestNameColumnsMigrateOldSchema(t *testing.T) {
 	}
 }
 
+func TestAddFakeUser(t *testing.T) {
+	db := newTestDB(t)
+	const chatID = int64(100)
+
+	// A real (positive-id) player already in the chat.
+	mustAddUser(t, db, 500, chatID)
+
+	id1, err := AddFakeUser(db, chatID, "Вася", "")
+	if err != nil {
+		t.Fatalf("AddFakeUser: %v", err)
+	}
+	id2, err := AddFakeUser(db, chatID, "Петя", "")
+	if err != nil {
+		t.Fatalf("AddFakeUser: %v", err)
+	}
+
+	// Fakes get negative ids, below any real id, and distinct from each other.
+	if id1 != -1 || id2 != -2 {
+		t.Fatalf("fake ids = %d, %d; want -1, -2", id1, id2)
+	}
+
+	// The name is stored and the fake is an active player.
+	fn, _, ok, err := GetUserNameDB(db, id1, chatID)
+	if err != nil || !ok {
+		t.Fatalf("GetUserNameDB(fake) ok=%v err=%v", ok, err)
+	}
+	if fn != "Вася" {
+		t.Fatalf("fake name = %q, want Вася", fn)
+	}
+
+	players, err := GetAllPlayers(db, chatID)
+	if err != nil {
+		t.Fatalf("GetAllPlayers: %v", err)
+	}
+	if len(players) != 3 {
+		t.Fatalf("expected 3 active players (1 real + 2 fake), got %d", len(players))
+	}
+}
+
+func TestAddFakeUserFirstInChat(t *testing.T) {
+	db := newTestDB(t)
+
+	id, err := AddFakeUser(db, 100, "Один", "")
+	if err != nil {
+		t.Fatalf("AddFakeUser: %v", err)
+	}
+	if id != -1 {
+		t.Fatalf("first fake id = %d, want -1", id)
+	}
+}
+
 // --- helpers ---
 
 func mustAddUser(t *testing.T, db *sql.DB, userID, chatID int64) {

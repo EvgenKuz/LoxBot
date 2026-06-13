@@ -26,9 +26,20 @@ The bot is configured through environment variables:
 | --- | --- |
 | `BOT_KEY` | Telegram Bot API token from [@BotFather](https://t.me/BotFather). |
 | `WEBHOOK_URL` | Public HTTPS URL Telegram will POST updates to. |
+| `DEBUG_COMMANDS` | Optional. Set to any non-empty value to enable testing-only commands (see below). Leave unset in production. |
 
 The bot runs in **webhook mode** and listens on `:1080`, so `WEBHOOK_URL` must be a public
 HTTPS endpoint that forwards to that port (e.g. via a reverse proxy).
+
+### Debug commands
+
+When `DEBUG_COMMANDS` is set, extra commands are registered for testing against a real
+(test) bot. They are **not** registered when the variable is unset, so they never reach
+production.
+
+| Command | What it does |
+| --- | --- |
+| `/addfake <name>` | Add a synthetic player with the given name, so one tester can fill a chat. Fakes get negative ids and a stored name, so they're picked and announced like real players without needing the bot to be a chat admin. |
 
 ### About `.env`
 

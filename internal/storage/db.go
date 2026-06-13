@@ -162,6 +162,28 @@ VALUES ($1, $2, $3, $4);
 	return err
 }
 
+// AddFakeUser registers a synthetic player for testing and returns its id. Real
+// Telegram user ids are positive, so fakes get negative ids (each one below the
+// chat's current minimum) to avoid colliding with real users. The stored name
+// is what gets displayed, since a fake has no Telegram identity to look up.
+func AddFakeUser(db *sql.DB, chatId int64, firstName, lastName string) (int64, error) {
+	var minID sql.NullInt64
+	if err := db.QueryRow(`SELECT MIN(user_id) FROM users WHERE chat_id = $1;`, chatId).Scan(&minID); err != nil {
+		return 0, err
+	}
+
+	newID := int64(-1)
+	if minID.Valid && minID.Int64 <= 0 {
+		newID = minID.Int64 - 1
+	}
+
+	if err := AddUser(db, newID, chatId, firstName, lastName); err != nil {
+		return 0, err
+	}
+
+	return newID, nil
+}
+
 // UpdateUserName refreshes the stored Telegram name for an existing player. It
 // updates nothing if the user is not registered in the chat.
 func UpdateUserName(db *sql.DB, userId int64, chatId int64, firstName, lastName string) error {
