@@ -1,7 +1,8 @@
-package main
+package storage
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,18 +30,24 @@ func CreateConnection() (*sql.DB, error) {
 	}
 	dir := filepath.Dir(exec)
 
-	db, err := sql.Open("sqlite", filepath.Join(dir, "database", "database.sqlite"))
+	return Open(filepath.Join(dir, "database", "database.sqlite"))
+}
+
+// Open opens (or creates) the SQLite database at path and ensures the schema
+// exists. It is the path-explicit core of CreateConnection, exposed so tests
+// can point at a temporary database.
+func Open(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
 
-	err = createTables(db)
-	if err != nil {
+	if err := createTables(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 
-	return db, err
+	return db, nil
 }
 
 func createTables(db *sql.DB) error {
@@ -88,11 +95,14 @@ SELECT games.chat_id, games.date, lox.user_id, winner.user_id FROM games LEFT OU
 	if err == nil {
 		return game, nil
 	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Game{}, err
+	}
 
 	statement = `
 INSERT INTO games (chat_id, date, lox_id, winner_id) VALUES ($1, $2, null, null);
 `
-	_, err = db.Exec(statement, chatId, dateFormated, game.LoxTelegramId)
+	_, err = db.Exec(statement, chatId, dateFormated)
 	if err != nil {
 		return Game{}, err
 	}
@@ -110,48 +120,70 @@ VALUES ($1, $2);
 	return err
 }
 
-func AddWinner(db *sql.DB, userId int64, chatId int64) error {
+// AddWinner records the winner for today's game in the chat, but only if one has
+// not already been set. It returns true when this call is the one that set the
+// winner, so concurrent callers don't both announce a pick.
+func AddWinner(db *sql.DB, userId int64, chatId int64) (bool, error) {
 	year, month, day := time.Now().Date()
 	monthInt := int(month)
 	dateFormated := fmt.Sprintf("%d-%02d-%02d", year, monthInt, day)
 
 	var userTableId int64
-	row := db.QueryRow(`SELECT id FROM users WHERE user_id = $1;`, userId)
+	row := db.QueryRow(`SELECT id FROM users WHERE user_id = $1 AND chat_id = $2;`, userId, chatId)
 	if err := row.Err(); err != nil {
-		return err
+		return false, err
 	}
 	if err := row.Scan(&userTableId); err != nil {
-		return err
+		return false, err
 	}
 
 	statement := `
-UPDATE games SET winner_id = $1 WHERE chat_id = $2 and date = $3;
+UPDATE games SET winner_id = $1 WHERE chat_id = $2 AND date = $3 AND winner_id IS NULL;
 `
-	_, err := db.Exec(statement, userTableId, chatId, dateFormated)
+	res, err := db.Exec(statement, userTableId, chatId, dateFormated)
+	if err != nil {
+		return false, err
+	}
 
-	return err
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+
+	return affected > 0, nil
 }
 
-func AddLox(db *sql.DB, userId int64, chatId int64) error {
+// AddLox records the lox for today's game in the chat, but only if one has not
+// already been set. It returns true when this call is the one that set the lox,
+// so concurrent callers don't both announce a pick.
+func AddLox(db *sql.DB, userId int64, chatId int64) (bool, error) {
 	year, month, day := time.Now().Date()
 	monthInt := int(month)
 	dateFormated := fmt.Sprintf("%d-%02d-%02d", year, monthInt, day)
 
 	var userTableId int64
-	row := db.QueryRow(`SELECT id FROM users WHERE user_id = $1;`, userId)
+	row := db.QueryRow(`SELECT id FROM users WHERE user_id = $1 AND chat_id = $2;`, userId, chatId)
 	if err := row.Err(); err != nil {
-		return err
+		return false, err
 	}
 	if err := row.Scan(&userTableId); err != nil {
-		return err
+		return false, err
 	}
 
 	statement := `
-UPDATE games SET lox_id = $1 WHERE chat_id = $2 and date = $3;
+UPDATE games SET lox_id = $1 WHERE chat_id = $2 AND date = $3 AND lox_id IS NULL;
 `
-	_, err := db.Exec(statement, userTableId, chatId, dateFormated)
+	res, err := db.Exec(statement, userTableId, chatId, dateFormated)
+	if err != nil {
+		return false, err
+	}
 
-	return err
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+
+	return affected > 0, nil
 }
 
 func GetWinners(db *sql.DB, chatId int64) ([]GotLucky, error) {
@@ -159,6 +191,9 @@ func GetWinners(db *sql.DB, chatId int64) ([]GotLucky, error) {
 SELECT users.user_id, COUNT(users.user_id) as got_lucky FROM games INNER JOIN users ON games.winner_id = users.id WHERE games.chat_id = $1 GROUP BY games.winner_id ORDER BY got_lucky DESC;
 `
 	rows, err := db.Query(statement, chatId)
+	if err != nil {
+		return nil, err
+	}
 	defer func(rows *sql.Rows) {
 		_ = rows.Close()
 	}(rows)
@@ -166,14 +201,13 @@ SELECT users.user_id, COUNT(users.user_id) as got_lucky FROM games INNER JOIN us
 	var winners []GotLucky
 	for rows.Next() {
 		var user GotLucky
-		err = rows.Scan(&user.UserId, &user.Lucky)
-		if err != nil {
+		if err = rows.Scan(&user.UserId, &user.Lucky); err != nil {
 			return nil, err
 		}
 		winners = append(winners, user)
 	}
 
-	return winners, err
+	return winners, rows.Err()
 }
 
 func GetLoxes(db *sql.DB, chatId int64) ([]GotLucky, error) {
@@ -181,6 +215,9 @@ func GetLoxes(db *sql.DB, chatId int64) ([]GotLucky, error) {
 SELECT users.user_id, COUNT(users.user_id) as got_unlucky FROM games INNER JOIN users ON games.lox_id = users.id WHERE games.chat_id = $1 GROUP BY games.lox_id ORDER BY got_unlucky DESC;
 `
 	rows, err := db.Query(statement, chatId)
+	if err != nil {
+		return nil, err
+	}
 	defer func(rows *sql.Rows) {
 		_ = rows.Close()
 	}(rows)
@@ -188,14 +225,13 @@ SELECT users.user_id, COUNT(users.user_id) as got_unlucky FROM games INNER JOIN 
 	var loxes []GotLucky
 	for rows.Next() {
 		var user GotLucky
-		err = rows.Scan(&user.UserId, &user.Lucky)
-		if err != nil {
+		if err = rows.Scan(&user.UserId, &user.Lucky); err != nil {
 			return nil, err
 		}
 		loxes = append(loxes, user)
 	}
 
-	return loxes, err
+	return loxes, rows.Err()
 }
 
 func UserExists(db *sql.DB, userId int64, chatId int64) (bool, error) {
@@ -255,6 +291,9 @@ func GetAllPlayers(db *sql.DB, chatId int64) ([]int64, error) {
 SELECT user_id FROM users WHERE chat_id = $1 AND active = TRUE;
 `
 	rows, err := db.Query(statement, chatId)
+	if err != nil {
+		return nil, err
+	}
 	defer func(rows *sql.Rows) {
 		_ = rows.Close()
 	}(rows)
@@ -262,12 +301,11 @@ SELECT user_id FROM users WHERE chat_id = $1 AND active = TRUE;
 	var playerIds []int64
 	for rows.Next() {
 		var user int64
-		err = rows.Scan(&user)
-		if err != nil {
+		if err = rows.Scan(&user); err != nil {
 			return nil, err
 		}
 		playerIds = append(playerIds, user)
 	}
 
-	return playerIds, nil
+	return playerIds, rows.Err()
 }

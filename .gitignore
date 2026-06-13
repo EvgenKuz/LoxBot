@@ -33,3 +33,6 @@ go.work.sum
 
 # Database
 database.sqlite
+
+# Exec file
+lox-bot
