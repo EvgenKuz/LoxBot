@@ -10,6 +10,9 @@ import (
 
 	"github.com/go-telegram/bot"
 	"github.com/google/uuid"
+
+	"desolidify.ru/lox-bot/internal/storage"
+	"desolidify.ru/lox-bot/internal/telegram"
 )
 
 func main() {
@@ -18,7 +21,7 @@ func main() {
 
 	log := slog.Default()
 	slog.SetLogLoggerLevel(slog.LevelInfo)
-	db, err := CreateConnection()
+	db, err := storage.CreateConnection()
 	if err != nil {
 		log.Error("Failed to connect to database", "err", err.Error())
 		return
@@ -42,12 +45,16 @@ func main() {
 	}
 	apiKey := uuid.New().String()
 
-	b, err := bot.New(botKey)
+	b, err := bot.New(botKey,
+		bot.WithWebhookSecretToken(apiKey),
+		bot.WithMiddlewares(telegram.NameMiddleware(db, log)),
+	)
 	if err != nil || b == nil {
-		log.Error("Failed to create bot", "err")
+		log.Error("Failed to create bot", "err", err)
 		return
 	}
-	RegisterHandlers(b, db, log)
+	debugCommands := os.Getenv("DEBUG_COMMANDS") != ""
+	telegram.RegisterHandlers(b, db, log, debugCommands)
 
 	_, err = b.SetWebhook(ctx, &bot.SetWebhookParams{
 		URL:         webhookURL,

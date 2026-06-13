@@ -1,4 +1,4 @@
-package main
+package telegram
 
 import (
 	"context"
@@ -9,14 +9,15 @@ import (
 	"regexp"
 	"strings"
 	"time"
-)
 
-import (
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+
+	"desolidify.ru/lox-bot/internal/storage"
 )
 
-const WaitTime = 2 * time.Second
+// waitTime is a var, not a const, so tests can shorten it to zero.
+var waitTime = 2 * time.Second
 
 func sendMessage(ctx context.Context, b *bot.Bot, log *slog.Logger, chatID int64, text string) bool {
 	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
@@ -43,13 +44,14 @@ func handlerRegister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bo
 		userId := update.Message.From.ID
 		chatId := update.Message.Chat.ID
 
-		exists, err := UserExists(db, userId, chatId)
+		exists, err := storage.UserExists(db, userId, chatId)
 		if err != nil {
-
+			log.Error("DB failed to check if user exists", "user_id", userId, "chat_id", chatId, "err", err.Error())
+			return
 		}
 
 		if !exists {
-			err = AddUser(db, userId, chatId)
+			err = storage.AddUser(db, userId, chatId, update.Message.From.FirstName, update.Message.From.LastName)
 			if err != nil {
 				log.Error("DB failed to add user", "user_id", userId, "chat_id", chatId, "err", err.Error())
 				return
@@ -63,18 +65,21 @@ func handlerRegister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bo
 					ChatID:    chatId,
 				},
 			})
+			if err != nil {
+				log.Error("Failed to send message to chat", "user_id", userId, "chat_id", chatId, "err", err.Error())
+			}
 
 			return
 		}
 
-		active, err := IsActive(db, userId, chatId)
+		active, err := storage.IsActive(db, userId, chatId)
 		if err != nil {
 			log.Error("DB failed to check if user is active", "user_id", userId, "chat_id", chatId, "err", err.Error())
 			return
 		}
 
 		if !active {
-			err = ActivateUser(db, userId, chatId)
+			err = storage.ActivateUser(db, userId, chatId)
 			if err != nil {
 				log.Error("DB failed to activate user", "user_id", userId, "chat_id", chatId, "err", err.Error())
 				return
@@ -113,7 +118,7 @@ func handleUnregister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.B
 		userId := update.Message.From.ID
 		chatId := update.Message.Chat.ID
 
-		exists, err := UserExists(db, userId, chatId)
+		exists, err := storage.UserExists(db, userId, chatId)
 		if err != nil {
 			log.Error("DB failed to check if user exists", "user_id", userId, "chat_id", chatId, "err", err.Error())
 			return
@@ -133,7 +138,7 @@ func handleUnregister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.B
 			return
 		}
 
-		active, err := IsActive(db, userId, chatId)
+		active, err := storage.IsActive(db, userId, chatId)
 		if err != nil {
 			log.Error("Failed to check if user is active", "user_id", userId, "chat_id", chatId, "err", err.Error())
 			return
@@ -153,7 +158,7 @@ func handleUnregister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.B
 			return
 		}
 
-		err = DeactivateUser(db, userId, chatId)
+		err = storage.DeactivateUser(db, userId, chatId)
 		if err != nil {
 			log.Error("DB failed to deactivate user", "user_id", userId, "chat_id", chatId, "err", err.Error())
 			return
@@ -178,30 +183,15 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		chatId := update.Message.Chat.ID
 
-		players, err := GetAllPlayers(db, chatId)
-		if err != nil {
-			log.Error("DB failed to get players in chat", "chat_id", chatId, "err", err.Error())
-			return
-		}
-		if len(players) == 0 {
-			text := "Нет активных игроков("
-			sendMessage(ctx, b, log, chatId, text)
-			return
-		}
-
-		game, err := GetTodayGame(db, chatId)
+		// Check for an already-decided result first, so it can still be shown
+		// even if every player has since left the game.
+		game, err := storage.GetTodayGame(db, chatId)
 		if err != nil {
 			log.Error("Failed to get today's game", "chat_id", chatId, "err", err.Error())
 			return
 		}
 		if game.WinTelegramId != nil {
-			player, got := getPlayerInfo(ctx, b, log, *game.WinTelegramId, chatId)
-			if !got {
-				return
-			}
-
-			firstName := player.FirstName
-			lastName := player.LastName
+			firstName, lastName := resolveName(ctx, b, db, log, *game.WinTelegramId, chatId)
 			var message string
 			if lastName == "" {
 				message = fmt.Sprintf("Сегодня Красавчик Дня %s!", firstName)
@@ -213,6 +203,17 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 			return
 		}
 
+		players, err := storage.GetAllPlayers(db, chatId)
+		if err != nil {
+			log.Error("DB failed to get players in chat", "chat_id", chatId, "err", err.Error())
+			return
+		}
+		if len(players) == 0 {
+			text := "Нет активных игроков("
+			sendMessage(ctx, b, log, chatId, text)
+			return
+		}
+
 		var chosenPlayerId int64
 		for {
 			randomIndex := rand.IntN(len(players))
@@ -221,17 +222,17 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 				break
 			}
 		}
-		if err = AddWinner(db, chosenPlayerId, chatId); err != nil {
+		set, err := storage.AddWinner(db, chosenPlayerId, chatId)
+		if err != nil {
 			log.Error("DB failed to add winner", "user_id", chosenPlayerId, "chat_id", chatId, "err", err.Error())
+			return
 		}
-
-		player, got := getPlayerInfo(ctx, b, log, chosenPlayerId, chatId)
-		if !got {
+		if !set {
+			// Another /run set the winner first; that call announces it.
 			return
 		}
 
-		firstName := player.FirstName
-		lastName := player.LastName
+		firstName, lastName := resolveName(ctx, b, db, log, chosenPlayerId, chatId)
 		var message string
 		if lastName == "" {
 			message = fmt.Sprintf("Сегодня Красавчик дня...\n\n%s!!!", firstName)
@@ -240,11 +241,11 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 		}
 
 		sendMessage(ctx, b, log, chatId, "Смотрю на ваши лица...")
-		time.Sleep(WaitTime)
+		time.Sleep(waitTime)
 		sendMessage(ctx, b, log, chatId, "Чекаю сообщения...")
-		time.Sleep(WaitTime)
+		time.Sleep(waitTime)
 		sendMessage(ctx, b, log, chatId, "Готовлю губы для поцелуя...")
-		time.Sleep(WaitTime)
+		time.Sleep(waitTime)
 		sendMessage(ctx, b, log, chatId, message)
 		return
 	}
@@ -254,35 +255,15 @@ func handleLoxRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, 
 	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		chatId := update.Message.Chat.ID
 
-		players, err := GetAllPlayers(db, chatId)
-		if err != nil {
-			log.Error("DB failed to get players in chat", "chat_id", chatId, "err", err.Error())
-			return
-		}
-		if len(players) == 0 {
-			_, err = b.SendMessage(ctx, &bot.SendMessageParams{
-				ChatID: chatId,
-				Text:   "Нет активных игроков(",
-			})
-			if err != nil {
-				log.Error("Failed to send message to chat", "chat_id", chatId, "err", err.Error())
-			}
-			return
-		}
-
-		game, err := GetTodayGame(db, chatId)
+		// Check for an already-decided result first, so it can still be shown
+		// even if every player has since left the game.
+		game, err := storage.GetTodayGame(db, chatId)
 		if err != nil {
 			log.Error("Failed to get today's game", "chat_id", chatId, "err", err.Error())
 			return
 		}
 		if game.LoxTelegramId != nil {
-			player, got := getPlayerInfo(ctx, b, log, *game.LoxTelegramId, chatId)
-			if !got {
-				return
-			}
-
-			firstName := player.FirstName
-			lastName := player.LastName
+			firstName, lastName := resolveName(ctx, b, db, log, *game.LoxTelegramId, chatId)
 			var message string
 			if lastName == "" {
 				message = fmt.Sprintf("Сегодня Лох Дня %s!", firstName)
@@ -294,6 +275,16 @@ func handleLoxRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, 
 			return
 		}
 
+		players, err := storage.GetAllPlayers(db, chatId)
+		if err != nil {
+			log.Error("DB failed to get players in chat", "chat_id", chatId, "err", err.Error())
+			return
+		}
+		if len(players) == 0 {
+			sendMessage(ctx, b, log, chatId, "Нет активных игроков(")
+			return
+		}
+
 		var chosenPlayerId int64
 		for {
 			randomIndex := rand.IntN(len(players))
@@ -302,16 +293,17 @@ func handleLoxRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, 
 				break
 			}
 		}
-		if err = AddLox(db, chosenPlayerId, chatId); err != nil {
+		set, err := storage.AddLox(db, chosenPlayerId, chatId)
+		if err != nil {
 			log.Error("DB failed to add lox", "user_id", chosenPlayerId, "chat_id", chatId, "err", err.Error())
-		}
-
-		player, got := getPlayerInfo(ctx, b, log, chosenPlayerId, chatId)
-		if !got {
 			return
 		}
-		firstName := player.FirstName
-		lastName := player.LastName
+		if !set {
+			// Another /lox set the lox first; that call announces it.
+			return
+		}
+
+		firstName, lastName := resolveName(ctx, b, db, log, chosenPlayerId, chatId)
 		var message string
 		if lastName == "" {
 			message = fmt.Sprintf("Сегодня Лох дня...\n\n%s!!!", firstName)
@@ -320,11 +312,11 @@ func handleLoxRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, 
 		}
 
 		sendMessage(ctx, b, log, chatId, "Сру в штаны...")
-		time.Sleep(WaitTime)
+		time.Sleep(waitTime)
 		sendMessage(ctx, b, log, chatId, "Надеваю ведро на голову...")
-		time.Sleep(WaitTime)
+		time.Sleep(waitTime)
 		sendMessage(ctx, b, log, chatId, "Готовлюсь харкаться...")
-		time.Sleep(WaitTime)
+		time.Sleep(waitTime)
 		sendMessage(ctx, b, log, chatId, message)
 		return
 	}
@@ -357,11 +349,37 @@ func getPlayerInfo(ctx context.Context, b *bot.Bot, log *slog.Logger, userId int
 	return nil, false
 }
 
+// resolveName always yields a usable name so a command never aborts silently:
+// the stored name, else a live Telegram lookup (needs admin), else a
+// placeholder. A placeholder self-heals once the player next uses the bot.
+func resolveName(ctx context.Context, b *bot.Bot, db *sql.DB, log *slog.Logger, userId int64, chatId int64) (firstName, lastName string) {
+	fn, ln, found, err := storage.GetUserNameDB(db, userId, chatId)
+	if err != nil {
+		log.Error("DB failed to get stored user name", "user_id", userId, "chat_id", chatId, "err", err.Error())
+	}
+	if found && fn != "" {
+		return fn, ln
+	}
+
+	if player, got := getPlayerInfo(ctx, b, log, userId, chatId); got {
+		return player.FirstName, player.LastName
+	}
+
+	return fmt.Sprintf("Игрок #%04d", abs(userId)%10000), ""
+}
+
+func abs(n int64) int64 {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
 func handleStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
 	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		chatId := update.Message.Chat.ID
 
-		results, err := GetWinners(db, chatId)
+		results, err := storage.GetWinners(db, chatId)
 		if err != nil {
 			log.Error("DB failed to get winners in chat", "chat_id", chatId, "err", err.Error())
 		}
@@ -369,12 +387,7 @@ func handleStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *
 		var message strings.Builder
 		message.WriteString("Был Красавчиком Дня:\n")
 		for _, result := range results {
-			player, got := getPlayerInfo(ctx, b, log, result.UserId, chatId)
-			if !got {
-				return
-			}
-			firstName := player.FirstName
-			lastName := player.LastName
+			firstName, lastName := resolveName(ctx, b, db, log, result.UserId, chatId)
 
 			var line string
 			if lastName == "" {
@@ -393,7 +406,7 @@ func handleLoxStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot
 	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		chatId := update.Message.Chat.ID
 
-		results, err := GetLoxes(db, chatId)
+		results, err := storage.GetLoxes(db, chatId)
 		if err != nil {
 			log.Error("DB failed to get loxes in chat", "chat_id", chatId, "err", err.Error())
 		}
@@ -401,12 +414,7 @@ func handleLoxStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot
 		var message strings.Builder
 		message.WriteString("Был Лохом Дня:\n")
 		for _, result := range results {
-			player, got := getPlayerInfo(ctx, b, log, result.UserId, chatId)
-			if !got {
-				return
-			}
-			firstName := player.FirstName
-			lastName := player.LastName
+			firstName, lastName := resolveName(ctx, b, db, log, result.UserId, chatId)
 
 			var line string
 			if lastName == "" {
@@ -421,7 +429,62 @@ func handleLoxStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot
 	}
 }
 
-func RegisterHandlers(b *bot.Bot, db *sql.DB, log *slog.Logger) {
+// NameMiddleware keeps stored names fresh by recording the sender's name on
+// each message. It only updates already-registered users; it never creates one.
+func NameMiddleware(db *sql.DB, log *slog.Logger) bot.Middleware {
+	return func(next bot.HandlerFunc) bot.HandlerFunc {
+		return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+			if update.Message != nil && update.Message.From != nil {
+				from := update.Message.From
+				if err := storage.UpdateUserName(db, from.ID, update.Message.Chat.ID, from.FirstName, from.LastName); err != nil {
+					log.Error("Failed to update stored user name", "user_id", from.ID, "chat_id", update.Message.Chat.ID, "err", err.Error())
+				}
+			}
+			next(ctx, b, update)
+		}
+	}
+}
+
+// handleAddFake adds a synthetic player named by the command argument, e.g.
+// "/addfake Вася", so one tester can fill a chat.
+func handleAddFake(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
+	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		chatId := update.Message.Chat.ID
+
+		name := ""
+		if parts := strings.SplitN(update.Message.Text, " ", 2); len(parts) == 2 {
+			name = strings.TrimSpace(parts[1])
+		}
+		if name == "" {
+			sendMessage(ctx, b, log, chatId, "Использование: /addfake <имя>")
+			return
+		}
+
+		id, err := storage.AddFakeUser(db, chatId, name, "")
+		if err != nil {
+			log.Error("DB failed to add fake user", "chat_id", chatId, "err", err.Error())
+			return
+		}
+
+		sendMessage(ctx, b, log, chatId, fmt.Sprintf("Добавлен тестовый игрок %s (id %d)", name, id))
+	}
+}
+
+func handleNextDay(log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
+	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		date := storage.AdvanceDay()
+		sendMessage(ctx, b, log, update.Message.Chat.ID, fmt.Sprintf("Теперь \"сегодня\": %s", date))
+	}
+}
+
+func handleResetDay(log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
+	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		date := storage.ResetDay()
+		sendMessage(ctx, b, log, update.Message.Chat.ID, fmt.Sprintf("Дата сброшена на сегодня: %s", date))
+	}
+}
+
+func RegisterHandlers(b *bot.Bot, db *sql.DB, log *slog.Logger, debug bool) {
 	re := regexp.MustCompile("^/start(?:@.+)?$")
 	b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handlerStart(log))
 	re = regexp.MustCompile("^/register(?:@.+)?$")
@@ -436,4 +499,14 @@ func RegisterHandlers(b *bot.Bot, db *sql.DB, log *slog.Logger) {
 	b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleStats(db, log))
 	re = regexp.MustCompile("^/loxstats(?:@.+)?$")
 	b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleLoxStats(db, log))
+
+	// Testing-only commands, gated so they never reach production.
+	if debug {
+		re = regexp.MustCompile(`^/addfake(?:@\S+)?(?:\s.*)?$`)
+		b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleAddFake(db, log))
+		re = regexp.MustCompile("^/nextday(?:@.+)?$")
+		b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleNextDay(log))
+		re = regexp.MustCompile("^/resetday(?:@.+)?$")
+		b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleResetDay(log))
+	}
 }
