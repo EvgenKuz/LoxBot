@@ -517,6 +517,81 @@ func TestAddFakeUserFirstInChat(t *testing.T) {
 	}
 }
 
+// TestAdvanceDayStartsNewGame verifies the movable date: advancing the day
+// makes GetTodayGame return a fresh game, so multiple winners accumulate in the
+// stats for what is really one calendar day.
+func TestAdvanceDayStartsNewGame(t *testing.T) {
+	t.Cleanup(func() { ResetDay() })
+	ResetDay()
+
+	db := newTestDB(t)
+	const userID, chatID = int64(1), int64(100)
+	mustAddUser(t, db, userID, chatID)
+
+	// Day 0: one game, one win.
+	day0 := mustTodayGame(t, db, chatID)
+	if set, err := AddWinner(db, userID, chatID); err != nil || !set {
+		t.Fatalf("AddWinner day0: set=%v err=%v", set, err)
+	}
+
+	// Advance: a different date, hence a different game.
+	if AdvanceDay() == day0.Date {
+		t.Fatal("AdvanceDay should change the date")
+	}
+	day1 := mustTodayGame(t, db, chatID)
+	if day1.Date == day0.Date {
+		t.Fatalf("expected a new date after advancing, got %q twice", day1.Date)
+	}
+	if day1.WinTelegramId != nil {
+		t.Fatal("the new day's game should start without a winner")
+	}
+	if set, err := AddWinner(db, userID, chatID); err != nil || !set {
+		t.Fatalf("AddWinner day1: set=%v err=%v", set, err)
+	}
+
+	// Two games -> the player has two wins.
+	winners, err := GetWinners(db, chatID)
+	if err != nil {
+		t.Fatalf("GetWinners: %v", err)
+	}
+	if len(winners) != 1 || winners[0].Lucky != 2 {
+		t.Fatalf("expected user with 2 wins, got %+v", winners)
+	}
+
+	// Two distinct game rows exist for the chat.
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM games WHERE chat_id = $1;`, chatID).Scan(&count); err != nil {
+		t.Fatalf("count games: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 game rows, got %d", count)
+	}
+}
+
+func TestResetDay(t *testing.T) {
+	t.Cleanup(func() { ResetDay() })
+
+	AdvanceDay()
+	AdvanceDay()
+	if got := ResetDay(); got != currentDate() {
+		t.Fatalf("ResetDay returned %q, want current date", got)
+	}
+	// After reset, the offset is gone: AdvanceDay yields exactly tomorrow.
+	today := ResetDay()
+	if AdvanceDay() == today {
+		t.Fatal("after reset, advancing should move past today")
+	}
+}
+
+func mustTodayGame(t *testing.T, db *sql.DB, chatID int64) Game {
+	t.Helper()
+	g, err := GetTodayGame(db, chatID)
+	if err != nil {
+		t.Fatalf("GetTodayGame: %v", err)
+	}
+	return g
+}
+
 // --- helpers ---
 
 func mustAddUser(t *testing.T, db *sql.DB, userID, chatID int64) {

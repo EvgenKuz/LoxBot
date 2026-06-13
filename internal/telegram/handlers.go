@@ -481,6 +481,24 @@ func handleAddFake(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot,
 	}
 }
 
+// handleNextDay advances the bot's simulated "today" by one day so a new game
+// can be started without waiting for the calendar. Debug-only.
+func handleNextDay(log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
+	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		date := storage.AdvanceDay()
+		sendMessage(ctx, b, log, update.Message.Chat.ID, fmt.Sprintf("Теперь \"сегодня\": %s", date))
+	}
+}
+
+// handleResetDay restores the simulated "today" to the real current date.
+// Debug-only.
+func handleResetDay(log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
+	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		date := storage.ResetDay()
+		sendMessage(ctx, b, log, update.Message.Chat.ID, fmt.Sprintf("Дата сброшена на сегодня: %s", date))
+	}
+}
+
 func RegisterHandlers(b *bot.Bot, db *sql.DB, log *slog.Logger, debug bool) {
 	re := regexp.MustCompile("^/start(?:@.+)?$")
 	b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handlerStart(log))
@@ -501,5 +519,9 @@ func RegisterHandlers(b *bot.Bot, db *sql.DB, log *slog.Logger, debug bool) {
 	if debug {
 		re = regexp.MustCompile(`^/addfake(?:@\S+)?(?:\s.*)?$`)
 		b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleAddFake(db, log))
+		re = regexp.MustCompile("^/nextday(?:@.+)?$")
+		b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleNextDay(log))
+		re = regexp.MustCompile("^/resetday(?:@.+)?$")
+		b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleResetDay(log))
 	}
 }

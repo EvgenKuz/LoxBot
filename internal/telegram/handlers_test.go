@@ -270,6 +270,34 @@ func TestFakeUserPlaysWithoutAdmin(t *testing.T) {
 	}
 }
 
+// TestNextDayAllowsMultipleGames is the point of the movable date: /nextday
+// lets a tester accumulate several games (and stats) on one calendar day.
+func TestNextDayAllowsMultipleGames(t *testing.T) {
+	t.Cleanup(func() { storage.ResetDay() })
+	storage.ResetDay()
+
+	b, api := newBot(t)
+	db := testDB(t)
+	const userID, chatID = int64(77), int64(100)
+
+	if err := storage.AddUser(db, userID, chatID, "User77", ""); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	log := discardLogger()
+
+	// First game.
+	handleRun(db, log)(context.Background(), b, msg(userID, chatID))
+	// Move to a new day, second game.
+	handleNextDay(log)(context.Background(), b, msg(userID, chatID))
+	handleRun(db, log)(context.Background(), b, msg(userID, chatID))
+
+	// Stats now show two wins for the same player.
+	handleStats(db, log)(context.Background(), b, msg(userID, chatID))
+	if got := api.lastMessage(t); !strings.Contains(got.text, "2 раз") {
+		t.Fatalf("expected 2 wins after /nextday, got %q", got.text)
+	}
+}
+
 func TestNameMiddlewareUpdatesRegisteredUser(t *testing.T) {
 	db := testDB(t)
 	const userID, chatID = int64(50), int64(100)

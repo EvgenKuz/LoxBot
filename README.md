@@ -40,6 +40,11 @@ production.
 | Command | What it does |
 | --- | --- |
 | `/addfake <name>` | Add a synthetic player with the given name, so one tester can fill a chat. Fakes get negative ids and a stored name, so they're picked and announced like real players without needing the bot to be a chat admin. |
+| `/nextday` | Advance the bot's simulated "today" by one day, starting a fresh game. Lets you play several rounds and watch `/stats` accumulate without waiting for the calendar. |
+| `/resetday` | Reset the simulated date back to the real current day. |
+
+The simulated date is an in-memory offset (not persisted): it is shared across all
+chats and resets to the real date when the bot restarts.
 
 ### About `.env`
 

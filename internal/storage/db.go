@@ -6,10 +6,36 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// dayOffset shifts the bot's notion of "today" by a number of days. It is zero
+// in production; debug commands move it to simulate multiple days so stats can
+// be tested without waiting for the calendar.
+var dayOffset atomic.Int64
+
+// currentDate returns today's date (YYYY-MM-DD), adjusted by dayOffset. Games
+// are keyed by this string, so advancing the offset starts a new day's game.
+func currentDate() string {
+	year, month, day := time.Now().AddDate(0, 0, int(dayOffset.Load())).Date()
+	return fmt.Sprintf("%d-%02d-%02d", year, int(month), day)
+}
+
+// AdvanceDay moves the simulated "today" forward by one day and returns the new
+// date. Testing aid only.
+func AdvanceDay() string {
+	dayOffset.Add(1)
+	return currentDate()
+}
+
+// ResetDay restores "today" to the real current date and returns it.
+func ResetDay() string {
+	dayOffset.Store(0)
+	return currentDate()
+}
 
 type GotLucky struct {
 	UserId int64
@@ -120,9 +146,7 @@ func ensureUserNameColumns(db *sql.DB) error {
 }
 
 func GetTodayGame(db *sql.DB, chatId int64) (Game, error) {
-	year, month, day := time.Now().Date()
-	monthInt := int(month)
-	dateFormated := fmt.Sprintf("%d-%02d-%02d", year, monthInt, day)
+	dateFormated := currentDate()
 
 	statement := `
 SELECT games.chat_id, games.date, lox.user_id, winner.user_id FROM games LEFT OUTER JOIN users lox ON lox.id = games.lox_id LEFT OUTER JOIN users winner ON winner.id = games.winner_id WHERE games.chat_id = $1 AND games.date = $2;
@@ -212,9 +236,7 @@ func GetUserNameDB(db *sql.DB, userId int64, chatId int64) (firstName, lastName 
 // not already been set. It returns true when this call is the one that set the
 // winner, so concurrent callers don't both announce a pick.
 func AddWinner(db *sql.DB, userId int64, chatId int64) (bool, error) {
-	year, month, day := time.Now().Date()
-	monthInt := int(month)
-	dateFormated := fmt.Sprintf("%d-%02d-%02d", year, monthInt, day)
+	dateFormated := currentDate()
 
 	var userTableId int64
 	row := db.QueryRow(`SELECT id FROM users WHERE user_id = $1 AND chat_id = $2;`, userId, chatId)
@@ -245,9 +267,7 @@ UPDATE games SET winner_id = $1 WHERE chat_id = $2 AND date = $3 AND winner_id I
 // already been set. It returns true when this call is the one that set the lox,
 // so concurrent callers don't both announce a pick.
 func AddLox(db *sql.DB, userId int64, chatId int64) (bool, error) {
-	year, month, day := time.Now().Date()
-	monthInt := int(month)
-	dateFormated := fmt.Sprintf("%d-%02d-%02d", year, monthInt, day)
+	dateFormated := currentDate()
 
 	var userTableId int64
 	row := db.QueryRow(`SELECT id FROM users WHERE user_id = $1 AND chat_id = $2;`, userId, chatId)
