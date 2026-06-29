@@ -97,7 +97,63 @@ CREATE TABLE IF NOT EXISTS games (
 		return err
 	}
 
-	return ensureUserNameColumns(db)
+	if err := ensureUserNameColumns(db); err != nil {
+		return err
+	}
+
+	return dedupeUsers(db)
+}
+
+// dedupeUsers collapses duplicate users rows that share a (user_id, chat_id) —
+// older databases had no UNIQUE constraint, so a single person could end up
+// with several rows, which made them appear more than once in /stats. It keeps
+// the lowest id of each group, repoints games at it, removes the rest, and adds
+// the UNIQUE index so duplicates can't recur. Idempotent: a clean database has
+// no duplicates and the index already exists.
+func dedupeUsers(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Repoint games before deleting so no foreign key dangles. The subquery maps
+	// a row to the lowest id sharing its (user_id, chat_id) — its group's keeper.
+	if _, err := tx.Exec(`UPDATE games SET winner_id =
+		(SELECT MIN(u2.id) FROM users u1 JOIN users u2 ON u2.user_id = u1.user_id AND u2.chat_id = u1.chat_id WHERE u1.id = games.winner_id)
+		WHERE winner_id IS NOT NULL;`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE games SET lox_id =
+		(SELECT MIN(u2.id) FROM users u1 JOIN users u2 ON u2.user_id = u1.user_id AND u2.chat_id = u1.chat_id WHERE u1.id = games.lox_id)
+		WHERE lox_id IS NOT NULL;`); err != nil {
+		return err
+	}
+
+	keepers := `(SELECT MIN(id) FROM users GROUP BY user_id, chat_id)`
+
+	// Carry forward a duplicate's active flag and any non-empty name so nothing
+	// useful is lost when the extra rows are deleted.
+	if _, err := tx.Exec(`UPDATE users SET active = TRUE WHERE id IN ` + keepers +
+		` AND EXISTS (SELECT 1 FROM users d WHERE d.user_id = users.user_id AND d.chat_id = users.chat_id AND d.active = TRUE);`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE users SET
+		first_name = COALESCE(NULLIF(first_name, ''), (SELECT d.first_name FROM users d WHERE d.user_id = users.user_id AND d.chat_id = users.chat_id AND d.first_name IS NOT NULL AND d.first_name != '' ORDER BY d.id LIMIT 1)),
+		last_name  = COALESCE(NULLIF(last_name, ''),  (SELECT d.last_name  FROM users d WHERE d.user_id = users.user_id AND d.chat_id = users.chat_id AND d.last_name  IS NOT NULL AND d.last_name  != '' ORDER BY d.id LIMIT 1))
+		WHERE id IN ` + keepers + `;`); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`DELETE FROM users WHERE id NOT IN ` + keepers + `;`); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_user_chat ON users(user_id, chat_id);`); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 // ensureUserNameColumns adds the first_name/last_name columns to databases
@@ -169,10 +225,14 @@ INSERT INTO games (chat_id, date, lox_id, winner_id) VALUES ($1, $2, null, null)
 	return Game{chatId, dateFormated, nil, nil}, nil
 }
 
+// AddUser inserts a player. ON CONFLICT DO NOTHING makes it a no-op if the
+// (user_id, chat_id) already exists, so a registration that loses a race
+// against a concurrent one fails silently instead of duplicating the row.
 func AddUser(db *sql.DB, userId int64, chatId int64, firstName, lastName string) error {
 	statement := `
 INSERT INTO users (user_id, chat_id, first_name, last_name)
-VALUES ($1, $2, $3, $4);
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (user_id, chat_id) DO NOTHING;
 `
 	_, err := db.Exec(statement, userId, chatId, firstName, lastName)
 
@@ -287,7 +347,7 @@ UPDATE games SET lox_id = $1 WHERE chat_id = $2 AND date = $3 AND lox_id IS NULL
 
 func GetWinners(db *sql.DB, chatId int64) ([]GotLucky, error) {
 	statement := `
-SELECT users.user_id, COUNT(users.user_id) as got_lucky FROM games INNER JOIN users ON games.winner_id = users.id WHERE games.chat_id = $1 GROUP BY games.winner_id ORDER BY got_lucky DESC;
+SELECT users.user_id, COUNT(users.user_id) as got_lucky FROM games INNER JOIN users ON games.winner_id = users.id WHERE games.chat_id = $1 GROUP BY users.user_id ORDER BY got_lucky DESC;
 `
 	rows, err := db.Query(statement, chatId)
 	if err != nil {
@@ -311,7 +371,7 @@ SELECT users.user_id, COUNT(users.user_id) as got_lucky FROM games INNER JOIN us
 
 func GetLoxes(db *sql.DB, chatId int64) ([]GotLucky, error) {
 	statement := `
-SELECT users.user_id, COUNT(users.user_id) as got_unlucky FROM games INNER JOIN users ON games.lox_id = users.id WHERE games.chat_id = $1 GROUP BY games.lox_id ORDER BY got_unlucky DESC;
+SELECT users.user_id, COUNT(users.user_id) as got_unlucky FROM games INNER JOIN users ON games.lox_id = users.id WHERE games.chat_id = $1 GROUP BY users.user_id ORDER BY got_unlucky DESC;
 `
 	rows, err := db.Query(statement, chatId)
 	if err != nil {
