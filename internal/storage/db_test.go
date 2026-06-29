@@ -61,6 +61,37 @@ func TestAddUserAndExists(t *testing.T) {
 	}
 }
 
+// AddUser is a no-op when the (user_id, chat_id) already exists, so a
+// registration that races a concurrent one neither errors nor duplicates.
+func TestAddUserIgnoresDuplicate(t *testing.T) {
+	db := newTestDB(t)
+	const userID, chatID = int64(100), int64(200)
+
+	if err := AddUser(db, userID, chatID, "First", ""); err != nil {
+		t.Fatalf("AddUser first: %v", err)
+	}
+	if err := AddUser(db, userID, chatID, "Second", ""); err != nil {
+		t.Fatalf("AddUser duplicate should be a silent no-op, got: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE user_id = $1 AND chat_id = $2;`, userID, chatID).Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 row after duplicate insert, got %d", count)
+	}
+
+	// The original row is left untouched, not overwritten by the second call.
+	first, _, _, err := GetUserNameDB(db, userID, chatID)
+	if err != nil {
+		t.Fatalf("GetUserNameDB: %v", err)
+	}
+	if first != "First" {
+		t.Fatalf("first_name = %q, want %q (original preserved)", first, "First")
+	}
+}
+
 func TestActivateDeactivate(t *testing.T) {
 	db := newTestDB(t)
 	const userID, chatID = int64(1), int64(2)
@@ -301,6 +332,101 @@ func TestGetWinnersCountsAndOrdering(t *testing.T) {
 	}
 	if winners[1].UserId != 20 || winners[1].Lucky != 1 {
 		t.Fatalf("second winner = %+v, want user 20 with 1", winners[1])
+	}
+}
+
+// Legacy databases had no UNIQUE constraint, so a single Telegram user could
+// own several users rows in a chat. Even with such rows present, stats must
+// aggregate by the Telegram user_id so the person shows up once.
+func TestGetWinnersAggregatesDuplicateUserRows(t *testing.T) {
+	db := newTestDB(t)
+	const chatID = int64(55)
+
+	// Simulate a pre-migration database: drop the uniqueness guard and plant
+	// two rows for Telegram user 10.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_users_user_chat;`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO users (id, user_id, chat_id) VALUES (1, 10, 55), (2, 10, 55);`); err != nil {
+		t.Fatalf("seed duplicate rows: %v", err)
+	}
+
+	insertGame(t, db, chatID, "2024-03-01", nil, int64(1))
+	insertGame(t, db, chatID, "2024-03-02", nil, int64(2))
+
+	winners, err := GetWinners(db, chatID)
+	if err != nil {
+		t.Fatalf("GetWinners: %v", err)
+	}
+	if len(winners) != 1 {
+		t.Fatalf("expected user 10 to appear once, got %d rows (%+v)", len(winners), winners)
+	}
+	if winners[0].UserId != 10 || winners[0].Lucky != 2 {
+		t.Fatalf("winner = %+v, want user 10 with 2", winners[0])
+	}
+}
+
+// dedupeUsers collapses legacy duplicate rows, repoints games at the survivor,
+// preserves an active flag and name from the discarded rows, and installs the
+// UNIQUE index so duplicates cannot recur.
+func TestDedupeUsersMigration(t *testing.T) {
+	db := newTestDB(t)
+	const chatID = int64(55)
+
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_users_user_chat;`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	// Survivor (id 1) is inactive and unnamed; the duplicate (id 2) is active
+	// and carries the name. Both facts should land on the survivor.
+	if _, err := db.Exec(`INSERT INTO users (id, user_id, chat_id, active, first_name, last_name) VALUES
+		(1, 10, 55, FALSE, '', ''),
+		(2, 10, 55, TRUE, 'Bob', 'Jones');`); err != nil {
+		t.Fatalf("seed duplicate rows: %v", err)
+	}
+	insertGame(t, db, chatID, "2024-03-01", nil, int64(1))
+	insertGame(t, db, chatID, "2024-03-02", int64(2), int64(2))
+
+	if err := dedupeUsers(db); err != nil {
+		t.Fatalf("dedupeUsers: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE user_id = 10 AND chat_id = 55;`).Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 surviving row, got %d", count)
+	}
+
+	var active bool
+	var first, last string
+	if err := db.QueryRow(`SELECT active, first_name, last_name FROM users WHERE id = 1;`).Scan(&active, &first, &last); err != nil {
+		t.Fatalf("read survivor: %v", err)
+	}
+	if !active || first != "Bob" || last != "Jones" {
+		t.Fatalf("survivor = {active:%v first:%q last:%q}, want {true Bob Jones}", active, first, last)
+	}
+
+	// Games that pointed at the deleted row 2 now point at the survivor.
+	var dangling int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM games WHERE winner_id = 2 OR lox_id = 2;`).Scan(&dangling); err != nil {
+		t.Fatalf("count dangling: %v", err)
+	}
+	if dangling != 0 {
+		t.Fatalf("expected games repointed off row 2, found %d", dangling)
+	}
+
+	winners, err := GetWinners(db, chatID)
+	if err != nil {
+		t.Fatalf("GetWinners: %v", err)
+	}
+	if len(winners) != 1 || winners[0].UserId != 10 || winners[0].Lucky != 2 {
+		t.Fatalf("winners = %+v, want single user 10 with 2", winners)
+	}
+
+	// The UNIQUE index is back, so a duplicate insert now fails.
+	if _, err := db.Exec(`INSERT INTO users (user_id, chat_id) VALUES (10, 55);`); err == nil {
+		t.Fatal("expected duplicate insert to violate the UNIQUE index")
 	}
 }
 
