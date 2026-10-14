@@ -36,7 +36,8 @@ player played (throws, for 🎲), their wins and win rate. A throw is a win when
 
 For 🎲, three equal throws in a row by the same player win, even if other players throw in
 between, as long as the three are within 10 minutes of each other (so a run can't carry over to
-the next day). After a win the run starts over: six 5s in a row are two wins.
+the next day). After a win the run starts over: six 5s in a row are two wins. Its win rate is per three-throw
+attempt (wins ÷ throws × 3), so a perfect run reads 100% like the other games.
 
 The bot only sees these messages if it is a chat admin or has privacy mode disabled
 (`/setprivacy` in [@BotFather](https://t.me/BotFather)).
