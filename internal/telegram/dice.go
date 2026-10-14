@@ -198,6 +198,11 @@ func handleDiceStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bo
 					name = firstName + " " + lastName
 				}
 				percent := t.wins * 100 / t.throws
+				if game.streak > 0 {
+					// Per attempt of `streak` throws, so a perfect run reads 100%
+					// like the other games instead of topping out at 33%.
+					percent = t.wins * game.streak * 100 / t.throws
+				}
 				fmt.Fprintf(&table, "\n%s %6d %5d %3d%%", fitName(name), t.throws, t.wins, percent)
 			}
 

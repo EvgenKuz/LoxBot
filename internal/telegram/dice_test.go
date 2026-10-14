@@ -395,7 +395,7 @@ func TestHandleDiceStatsTable(t *testing.T) {
 		"Вася                    1     1 100%</pre>\n" +
 		"<b>🎲 Кубик</b>\n<pre>" +
 		"Игрок              Броски Побед    %\n" +
-		"Вася                    6     1  16%\n" +
+		"Вася                    6     1  50%\n" +
 		"Константинопольск…      1     0   0%</pre>\n" +
 		"<b>🏀 Баскетбол</b>\n<pre>" +
 		"Игрок              Сыграл Побед    %\n" +
@@ -429,5 +429,27 @@ func TestHandleDiceStatsEmpty(t *testing.T) {
 
 	if got := api.lastMessage(t).text; got != "Никто ещё не играл(" {
 		t.Fatalf("unexpected empty stats message: %q", got)
+	}
+}
+
+func TestHandleDiceStatsPerfectStreakIs100Percent(t *testing.T) {
+	b, api := newBot(t)
+	db := testDB(t)
+	const chatID = int64(100)
+
+	if err := storage.AddUser(db, 5, chatID, "Вася", ""); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	handle := handleDice(db, discardLogger())
+	for i := 1; i <= 6; i++ {
+		u := diceMsg(5, chatID, "🎲", 5)
+		u.Message.ID = i
+		u.Message.Date = int(time.Now().Unix())
+		handle(context.Background(), b, u)
+	}
+	handleDiceStats(db, discardLogger())(context.Background(), b, msg(5, chatID))
+
+	if got := api.lastMessage(t).text; !strings.Contains(got, "Вася                    6     2 100%") {
+		t.Fatalf("six equal throws should read 2 wins at 100%%: %q", got)
 	}
 }
