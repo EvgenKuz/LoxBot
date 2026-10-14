@@ -31,8 +31,9 @@ func TestMain(m *testing.M) {
 
 // sentMessage is a sendMessage call captured by the fake Telegram API.
 type sentMessage struct {
-	chatID int64
-	text   string
+	chatID    int64
+	text      string
+	parseMode string
 }
 
 // fakeAPI impersonates the Telegram Bot API. It records sendMessage calls and
@@ -53,7 +54,7 @@ func (f *fakeAPI) handler(w http.ResponseWriter, r *http.Request) {
 	case "sendMessage":
 		chatID, _ := strconv.ParseInt(r.FormValue("chat_id"), 10, 64)
 		f.mu.Lock()
-		f.messages = append(f.messages, sentMessage{chatID: chatID, text: r.FormValue("text")})
+		f.messages = append(f.messages, sentMessage{chatID: chatID, text: r.FormValue("text"), parseMode: r.FormValue("parse_mode")})
 		f.mu.Unlock()
 		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1}}`)
 

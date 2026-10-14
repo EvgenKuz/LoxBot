@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -748,5 +749,43 @@ func insertGame(t *testing.T, db *sql.DB, chatID int64, date string, loxRowID, w
 	)
 	if err != nil {
 		t.Fatalf("insertGame: %v", err)
+	}
+}
+
+func TestDiceThrowsOrderedAndDeduplicated(t *testing.T) {
+	db := newTestDB(t)
+	const chatID = int64(77)
+	at := time.Unix(1700000000, 0)
+
+	// Inserted out of order, with message 2 delivered twice.
+	for _, th := range []DiceThrow{
+		{MessageId: 3, UserId: 1, Emoji: "🎲", Value: 5, SentAt: at},
+		{MessageId: 1, UserId: 1, Emoji: "🎲", Value: 4, SentAt: at},
+		{MessageId: 2, UserId: 2, Emoji: "🎰", Value: 64, SentAt: at},
+		{MessageId: 2, UserId: 2, Emoji: "🎰", Value: 64, SentAt: at},
+	} {
+		if err := AddDiceThrow(db, chatID, th); err != nil {
+			t.Fatalf("AddDiceThrow: %v", err)
+		}
+	}
+	// Message ids are per chat, so the same id elsewhere is a different throw.
+	if err := AddDiceThrow(db, chatID+1, DiceThrow{MessageId: 1, UserId: 1, Emoji: "🎲", Value: 6, SentAt: at}); err != nil {
+		t.Fatalf("AddDiceThrow other chat: %v", err)
+	}
+
+	throws, err := GetDiceThrows(db, chatID)
+	if err != nil {
+		t.Fatalf("GetDiceThrows: %v", err)
+	}
+	if len(throws) != 3 {
+		t.Fatalf("got %d throws, want 3: %+v", len(throws), throws)
+	}
+	for i, want := range []int{1, 2, 3} {
+		if throws[i].MessageId != want {
+			t.Fatalf("throw %d has message id %d, want %d", i, throws[i].MessageId, want)
+		}
+	}
+	if got := throws[0]; got.UserId != 1 || got.Emoji != "🎲" || got.Value != 4 || !got.SentAt.Equal(at) {
+		t.Fatalf("first throw = %+v", got)
 	}
 }

@@ -15,8 +15,31 @@ day and per chat, and the bot keeps a running tally.
 | `/lox` | Pick today's *Лох дня*. Re-running the same day shows the existing pick. |
 | `/stats` | Leaderboard of how often each player was *Красавчик дня*. |
 | `/loxstats` | Leaderboard of how often each player was *Лох дня*. |
+| `/dicestats` | Throws and wins per player for Telegram's animated emojis (🎰 🎲 🎯 🏀 ⚽ 🎳). |
 
 Commands also work with an `@botname` suffix (e.g. `/run@MyLoxBot`).
+
+### Dice tally
+
+Every 🎰 🎲 🎯 🏀 ⚽ 🎳 someone sends in the chat is counted for them, whether or not they
+`/register`ed. Forwarded rolls don't count. `/dicestats` shows, per emoji, how many times each
+player played (throws, for 🎲), their wins and win rate. A throw is a win when:
+
+| Emoji | Win |
+| --- | --- |
+| 🎰 | three of a kind |
+| 🎲 | the third of three equal throws in a row (see below) |
+| 🎯 | bullseye |
+| 🏀 | ball goes in |
+| ⚽ | goal |
+| 🎳 | strike |
+
+For 🎲, three equal throws in a row by the same player win, even if other players throw in
+between, as long as the three are within 10 minutes of each other (so a run can't carry over to
+the next day). After a win the run starts over: six 5s in a row are two wins.
+
+The bot only sees these messages if it is a chat admin or has privacy mode disabled
+(`/setprivacy` in [@BotFather](https://t.me/BotFather)).
 
 ## Configuration
 

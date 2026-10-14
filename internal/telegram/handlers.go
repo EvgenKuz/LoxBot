@@ -499,6 +499,9 @@ func RegisterHandlers(b *bot.Bot, db *sql.DB, log *slog.Logger, debug bool) {
 	b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleStats(db, log))
 	re = regexp.MustCompile("^/loxstats(?:@.+)?$")
 	b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleLoxStats(db, log))
+	re = regexp.MustCompile("^/dicestats(?:@.+)?$")
+	b.RegisterHandlerRegexp(bot.HandlerTypeMessageText, re, handleDiceStats(db, log))
+	b.RegisterHandlerMatchFunc(isOwnDiceRoll, handleDice(db, log))
 
 	// Testing-only commands, gated so they never reach production.
 	if debug {
