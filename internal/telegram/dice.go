@@ -169,6 +169,7 @@ func handleDiceStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bo
 		throws, err := storage.GetDiceThrows(db, chatId)
 		if err != nil {
 			log.Error("DB failed to get dice throws in chat", "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 		byEmoji := scoreDice(throws)

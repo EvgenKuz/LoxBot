@@ -631,3 +631,89 @@ func mustGame(t *testing.T, db *sql.DB, chatID int64) storage.Game {
 	}
 	return g
 }
+
+// /run and /lox at almost the same time must not interleave their suspense
+// messages, and the second must see the first's pick so nobody is both.
+func TestRunAndLoxAtOnceDoNotOverlap(t *testing.T) {
+	waitTime = 20 * time.Millisecond
+	t.Cleanup(func() { waitTime = 0 })
+
+	runTexts := []string{"Смотрю на ваши лица...", "Чекаю сообщения...", "Готовлю губы для поцелуя...", "Сегодня Красавчик дня"}
+	loxTexts := []string{"Сру в штаны...", "Надеваю ведро на голову...", "Готовлюсь харкаться...", "Сегодня Лох дня"}
+
+	for i := 0; i < 5; i++ {
+		b, api := newBot(t)
+		db := testDB(t)
+		chatID := int64(100 + i)
+		for _, id := range []int64{1, 2} {
+			if err := storage.AddUser(db, id, chatID, fmt.Sprintf("User%d", id), ""); err != nil {
+				t.Fatalf("AddUser: %v", err)
+			}
+		}
+
+		var wg sync.WaitGroup
+		for _, h := range []func(context.Context, *bot.Bot, *models.Update){handleRun(db, discardLogger()), handleLoxRun(db, discardLogger())} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				h(context.Background(), b, msg(1, chatID))
+			}()
+		}
+		wg.Wait()
+
+		if len(api.messages) != 8 {
+			t.Fatalf("got %d messages, want 8: %+v", len(api.messages), api.messages)
+		}
+		first, second := runTexts, loxTexts
+		if !strings.HasPrefix(api.messages[0].text, runTexts[0]) {
+			first, second = loxTexts, runTexts
+		}
+		for j, want := range append(first, second...) {
+			if !strings.HasPrefix(api.messages[j].text, want) {
+				var got []string
+				for _, m := range api.messages {
+					got = append(got, m.text)
+				}
+				t.Fatalf("messages interleaved:\n%s", strings.Join(got, "\n"))
+			}
+		}
+
+		game := mustGame(t, db, chatID)
+		if game.WinTelegramId == nil || game.LoxTelegramId == nil {
+			t.Fatalf("both picks should be set: %+v", game)
+		}
+		if *game.WinTelegramId == *game.LoxTelegramId {
+			t.Fatalf("user %d picked as both Красавчик and Лох", *game.WinTelegramId)
+		}
+	}
+}
+
+// When the database fails, every command must say so instead of staying
+// silent, so the user knows to resend it.
+func TestCommandsReplyOnDBError(t *testing.T) {
+	handlers := map[string]func(*sql.DB, *slog.Logger) func(context.Context, *bot.Bot, *models.Update){
+		"/register":  handlerRegister,
+		"/leave":     handleUnregister,
+		"/run":       handleRun,
+		"/lox":       handleLoxRun,
+		"/stats":     handleStats,
+		"/loxstats":  handleLoxStats,
+		"/dicestats": handleDiceStats,
+		"/addfake":   handleAddFake,
+	}
+	for name, h := range handlers {
+		t.Run(name, func(t *testing.T) {
+			b, api := newBot(t)
+			db := testDB(t)
+			_ = db.Close()
+
+			u := msg(5, 100)
+			u.Message.Text = name + " Вася"
+			h(db, discardLogger())(context.Background(), b, u)
+
+			if got := api.lastMessage(t).text; got != "Что-то пошло не так, попробуй ещё раз" {
+				t.Fatalf("reply = %q, want the error message", got)
+			}
+		})
+	}
+}
