@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-telegram/bot"
@@ -18,6 +19,18 @@ import (
 
 // waitTime is a var, not a const, so tests can shorten it to zero.
 var waitTime = 2 * time.Second
+
+// chatLocks holds a *sync.Mutex per chat. Updates are handled concurrently, so
+// without it a /run and /lox sent together interleave their suspense messages
+// and both read the game before either pick is saved, which can make one
+// player both Красавчик and Лох.
+var chatLocks sync.Map
+
+func lockChat(chatId int64) (unlock func()) {
+	mu, _ := chatLocks.LoadOrStore(chatId, &sync.Mutex{})
+	mu.(*sync.Mutex).Lock()
+	return mu.(*sync.Mutex).Unlock
+}
 
 func sendMessage(ctx context.Context, b *bot.Bot, log *slog.Logger, chatID int64, text string) bool {
 	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
@@ -30,6 +43,12 @@ func sendMessage(ctx context.Context, b *bot.Bot, log *slog.Logger, chatID int64
 	}
 
 	return true
+}
+
+// sendError tells the chat a command failed, so it isn't mistaken for being
+// ignored and the user knows to resend it.
+func sendError(ctx context.Context, b *bot.Bot, log *slog.Logger, chatID int64) {
+	sendMessage(ctx, b, log, chatID, "Что-то пошло не так, попробуй ещё раз")
 }
 
 func handlerStart(log *slog.Logger) func(ctx context.Context, b *bot.Bot, update *models.Update) {
@@ -47,6 +66,7 @@ func handlerRegister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bo
 		exists, err := storage.UserExists(db, userId, chatId)
 		if err != nil {
 			log.Error("DB failed to check if user exists", "user_id", userId, "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 
@@ -54,6 +74,7 @@ func handlerRegister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bo
 			err = storage.AddUser(db, userId, chatId, update.Message.From.FirstName, update.Message.From.LastName)
 			if err != nil {
 				log.Error("DB failed to add user", "user_id", userId, "chat_id", chatId, "err", err.Error())
+				sendError(ctx, b, log, chatId)
 				return
 			}
 
@@ -75,6 +96,7 @@ func handlerRegister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bo
 		active, err := storage.IsActive(db, userId, chatId)
 		if err != nil {
 			log.Error("DB failed to check if user is active", "user_id", userId, "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 
@@ -82,6 +104,7 @@ func handlerRegister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bo
 			err = storage.ActivateUser(db, userId, chatId)
 			if err != nil {
 				log.Error("DB failed to activate user", "user_id", userId, "chat_id", chatId, "err", err.Error())
+				sendError(ctx, b, log, chatId)
 				return
 			}
 			_, err = b.SendMessage(ctx, &bot.SendMessageParams{
@@ -121,6 +144,7 @@ func handleUnregister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.B
 		exists, err := storage.UserExists(db, userId, chatId)
 		if err != nil {
 			log.Error("DB failed to check if user exists", "user_id", userId, "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 		if !exists {
@@ -141,6 +165,7 @@ func handleUnregister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.B
 		active, err := storage.IsActive(db, userId, chatId)
 		if err != nil {
 			log.Error("Failed to check if user is active", "user_id", userId, "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 		if !active {
@@ -161,6 +186,7 @@ func handleUnregister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.B
 		err = storage.DeactivateUser(db, userId, chatId)
 		if err != nil {
 			log.Error("DB failed to deactivate user", "user_id", userId, "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 
@@ -182,12 +208,14 @@ func handleUnregister(db *sql.DB, log *slog.Logger) func(context.Context, *bot.B
 func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
 	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		chatId := update.Message.Chat.ID
+		defer lockChat(chatId)()
 
 		// Check for an already-decided result first, so it can still be shown
 		// even if every player has since left the game.
 		game, err := storage.GetTodayGame(db, chatId)
 		if err != nil {
 			log.Error("Failed to get today's game", "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 		if game.WinTelegramId != nil {
@@ -206,6 +234,7 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 		players, err := storage.GetAllPlayers(db, chatId)
 		if err != nil {
 			log.Error("DB failed to get players in chat", "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 		if len(players) == 0 {
@@ -225,6 +254,7 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 		set, err := storage.AddWinner(db, chosenPlayerId, chatId)
 		if err != nil {
 			log.Error("DB failed to add winner", "user_id", chosenPlayerId, "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 		if !set {
@@ -254,12 +284,14 @@ func handleRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *mo
 func handleLoxRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *models.Update) {
 	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		chatId := update.Message.Chat.ID
+		defer lockChat(chatId)()
 
 		// Check for an already-decided result first, so it can still be shown
 		// even if every player has since left the game.
 		game, err := storage.GetTodayGame(db, chatId)
 		if err != nil {
 			log.Error("Failed to get today's game", "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 		if game.LoxTelegramId != nil {
@@ -278,6 +310,7 @@ func handleLoxRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, 
 		players, err := storage.GetAllPlayers(db, chatId)
 		if err != nil {
 			log.Error("DB failed to get players in chat", "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 		if len(players) == 0 {
@@ -296,6 +329,7 @@ func handleLoxRun(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, 
 		set, err := storage.AddLox(db, chosenPlayerId, chatId)
 		if err != nil {
 			log.Error("DB failed to add lox", "user_id", chosenPlayerId, "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 		if !set {
@@ -382,6 +416,8 @@ func handleStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot, *
 		results, err := storage.GetWinners(db, chatId)
 		if err != nil {
 			log.Error("DB failed to get winners in chat", "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
+			return
 		}
 
 		var message strings.Builder
@@ -409,6 +445,8 @@ func handleLoxStats(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot
 		results, err := storage.GetLoxes(db, chatId)
 		if err != nil {
 			log.Error("DB failed to get loxes in chat", "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
+			return
 		}
 
 		var message strings.Builder
@@ -463,6 +501,7 @@ func handleAddFake(db *sql.DB, log *slog.Logger) func(context.Context, *bot.Bot,
 		id, err := storage.AddFakeUser(db, chatId, name, "")
 		if err != nil {
 			log.Error("DB failed to add fake user", "chat_id", chatId, "err", err.Error())
+			sendError(ctx, b, log, chatId)
 			return
 		}
 
