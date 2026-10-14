@@ -56,7 +56,10 @@ func CreateConnection() (*sql.DB, error) {
 // Open is the path-explicit core of CreateConnection, exposed so tests can
 // point at a temporary database.
 func Open(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
+	// Handlers run concurrently and database/sql pools connections, so writes
+	// can collide; without a busy timeout the loser fails at once with
+	// SQLITE_BUSY instead of waiting its turn. It's per connection, hence the DSN.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +94,18 @@ CREATE TABLE IF NOT EXISTS games (
 
 	FOREIGN KEY (lox_id) REFERENCES users(id),
 	FOREIGN KEY (winner_id) REFERENCES users(id)
-)
+);
+
+CREATE TABLE IF NOT EXISTS dice_throws (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    emoji TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    sent_at INTEGER NOT NULL,
+
+    PRIMARY KEY (chat_id, message_id)
+);
 `
 	if _, err := db.Exec(query); err != nil {
 		return err
@@ -467,4 +481,56 @@ SELECT user_id FROM users WHERE chat_id = $1 AND active = TRUE;
 	}
 
 	return playerIds, rows.Err()
+}
+
+type DiceThrow struct {
+	MessageId int
+	UserId    int64
+	Emoji     string
+	Value     int
+	SentAt    time.Time
+}
+
+// AddDiceThrow stores raw throws rather than running totals: handlers run
+// concurrently, so quick throws can arrive out of order, and scoring them later
+// by message id is the only way to see them in the order they were sent. The
+// key also drops a redelivered update instead of counting it twice.
+func AddDiceThrow(db *sql.DB, chatId int64, throw DiceThrow) error {
+	statement := `
+INSERT INTO dice_throws (chat_id, message_id, user_id, emoji, value, sent_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (chat_id, message_id) DO NOTHING;
+`
+	_, err := db.Exec(statement, chatId, throw.MessageId, throw.UserId, throw.Emoji, throw.Value, throw.SentAt.Unix())
+
+	return err
+}
+
+// GetDiceThrows returns the chat's throws in the order they were sent.
+func GetDiceThrows(db *sql.DB, chatId int64) ([]DiceThrow, error) {
+	statement := `
+SELECT message_id, user_id, emoji, value, sent_at FROM dice_throws WHERE chat_id = $1 ORDER BY message_id;
+`
+	rows, err := db.Query(statement, chatId)
+	if err != nil {
+		return nil, err
+	}
+	defer func(rows *sql.Rows) {
+		_ = rows.Close()
+	}(rows)
+
+	var throws []DiceThrow
+	for rows.Next() {
+		var (
+			throw  DiceThrow
+			sentAt int64
+		)
+		if err = rows.Scan(&throw.MessageId, &throw.UserId, &throw.Emoji, &throw.Value, &sentAt); err != nil {
+			return nil, err
+		}
+		throw.SentAt = time.Unix(sentAt, 0)
+		throws = append(throws, throw)
+	}
+
+	return throws, rows.Err()
 }
