@@ -7,14 +7,20 @@ RUN go mod download
 COPY *.go ./
 COPY internal/ ./internal/
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /app/build/bot
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /app/build/bot \
+    && mkdir -p /app/build/database
 
-FROM gcr.io/distroless/static-debian13 AS release-stage
+FROM gcr.io/distroless/static-debian13:nonroot AS release-stage
 LABEL authors="Eugene Smith"
 
 WORKDIR /app
 
 COPY --from=build-stage /app/build/bot /app/bot
+# The database directory belongs to the nonroot user (65532) so the bot can
+# write to it; a new named volume inherits this ownership.
+COPY --from=build-stage --chown=65532:65532 /app/build/database /app/database
+
+USER 65532:65532
 
 EXPOSE 1080
 VOLUME ["/app/database"]
